@@ -1,0 +1,43 @@
+[tools]
+go = "1.27.1"
+staticcheck = "2026.2.1"
+
+[tasks.test]
+description = "Run unit tests"
+run = "go test ./..."
+
+[tasks.vet]
+description = "Run go vet"
+run = "go vet ./..."
+
+[tasks.fmt]
+description = "Fail if any file needs gofmt"
+run = '''
+files=$(gofmt -l .)
+if [ -n "$files" ]; then
+  printf 'gofmt needed on:\n%s\n' "$files" >&2
+  exit 1
+fi
+'''
+
+[tasks.lint]
+description = "gofmt check + go vet + staticcheck"
+depends = ["fmt", "vet"]
+run = "staticcheck ./..."
+
+[tasks.check]
+description = "Lint + test"
+depends = ["lint", "test"]
+
+[tasks.build]
+description = "Build stripped static release binary"
+env = { CGO_ENABLED = "0" }
+run = "go build -trimpath -ldflags='-s -w' -o tailshare ./cmd/tailshare"
+
+[tasks.run]
+description = "Run tailshare in local dev mode"
+run = "./tailshare -mode local"
+
+[tasks.default]
+description = "Verify: lint + test"
+depends = ["check"]
