@@ -28,15 +28,42 @@
     flex: none;
   }
   header b { color: #e6edf3; font-weight: 600; }
-  #state { color: #3fb950; }
+  #quality {
+    margin-left: 10px;
+    padding: 1px 4px;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    background: #161b22;
+    color: #8b949e;
+    font: inherit;
+    vertical-align: baseline;
+  }
+  /* Once the page has given up on WebRTC the picker has nothing left to
+     switch between, and offering a choice that changes nothing is worse than
+     not offering one. */
+  #quality:disabled { opacity: 0.4; }
+  #state { color: #3fb950; text-align: right; }
+  #state.wait { color: #d29922; }
   #state.off { color: #f85149; }
-  main { flex: 1; min-height: 0; display: flex; }
-  img {
+  /* Both surfaces occupy the same box, so the video can sit on top of the
+     still image without either moving. */
+  main { position: relative; flex: 1; min-height: 0; }
+  video, img {
+    position: absolute;
+    inset: 0;
     width: 100%;
     height: 100%;
     object-fit: contain;
-    background: #0b0d10;
   }
+  /* The video is on top from the very first moment and is never hidden. A
+     browser does not composite a video it cannot see, so hiding it to wait for
+     its first frame means waiting for a frame that can never arrive: the
+     still image would stay up and WebRTC would never take over. An empty
+     video paints nothing at all, so the still image underneath shows through
+     until there is something to show. */
+  video { z-index: 1; background: transparent; }
+  img { z-index: 0; background: #0b0d10; }
+  img.hidden { visibility: hidden; }
   footer {
     flex: none;
     padding: 6px 14px;
@@ -47,36 +74,420 @@
   }
 </style>
 </head>
-<body>
+<body{{if .WebRTC}} data-webrtc="1"{{end}}{{if .Qualities}} data-quality="{{.Selected.Name}}"{{end}}>
 <header>
-  <b>tailshare</b>
+  <span><b>tailshare</b>{{if and .WebRTC (gt (len .Qualities) 1)}}<select id="quality" aria-label="stream quality">{{range .Qualities}}<option value="{{.Name}}"{{if eq .Name $.Selected.Name}} selected{{end}}>{{.Name}}</option>{{end}}</select>{{end}}</span>
   <span id="state">connecting…</span>
 </header>
-<main><img id="screen" alt="shared screen"></main>
+<main>
+  <video id="screen" autoplay muted playsinline></video>
+  <img id="fallback" alt="shared screen">
+</main>
 <footer>{{.Banner}}</footer>
 <script>
-  var img = document.getElementById('screen');
-  var state = document.getElementById('state');
-  var retry = 0;
+(function () {
+  var HAS_WEBRTC = document.body.hasAttribute('data-webrtc');
+  var GATHER_TIMEOUT = 5000;
+  // How long to keep a WebRTC connection that has not shown a frame yet. The
+  // MJPEG stream is on screen the whole time this runs, so waiting costs
+  // nothing but the bitrate the underlay is using, and giving up early costs
+  // the better picture for good. Generous on purpose.
+  var FIRST_FRAME_TIMEOUT = 30000;
+  var GIVE_UP_ON_DISCONNECT = 8000;
+  // A connection that stops presenting frames is worse than no WebRTC at all:
+  // the picture is frozen and the browser has no idea anything is wrong. Three
+  // samples is a second of stats, so three seconds without a new frame.
+  var STALL_SAMPLES = 3;
 
-  function connect() {
-    img.src = '/stream';
+  var video = document.getElementById('screen');
+  var img = document.getElementById('fallback');
+  var state = document.getElementById('state');
+  var picker = document.getElementById('quality');
+
+  var pc = null;
+  var statsTimer = 0;
+  var watchdog = 0;
+  var decoded = false;
+  var settled = false;
+  var retry = 0;
+  var attempt = 0;
+  var lastBytes = null;
+  var lastAt = 0;
+  var lastShown = -1;
+  var quiet = 0;
+  // The rung the viewer is watching. It is fixed for the life of a connection:
+  // the server started an encoder for it before the offer was answered, so
+  // changing it means asking for a whole new connection rather than
+  // renegotiating this one.
+  var level = '';
+
+  // The page is rendered with the rung the viewer asked for already chosen, so
+  // a reload or a shared link comes back on the same picture.
+  function chosen() {
+    if (picker && picker.value) {
+      return picker.value;
+    }
+    return document.body.getAttribute('data-quality') || '';
   }
 
-  img.addEventListener('load', function () {
+  // Putting the choice in the URL rather than in a cookie is what makes it
+  // shareable and survives a reload, and replacing the entry instead of pushing
+  // one keeps the back button meaning "leave the page" rather than "undo my
+  // last change of resolution".
+  function remember() {
+    if (!level) {
+      return;
+    }
+    history.replaceState(null, '', '?quality=' + encodeURIComponent(level));
+  }
+
+  function showWebRTC() {
+    // The video is already in the right place; all that changes is that the
+    // still image underneath is no longer wanted.
+    img.className = 'hidden';
+  }
+
+  function showMJPEG() {
+    img.className = '';
+  }
+
+  function say(text, cls) {
+    state.textContent = text;
+    state.className = cls || '';
+  }
+
+  // MJPEG cannot fail in a way worth caring about: the server always has a
+  // capture, and the browser paints the first one as soon as it arrives. So it
+  // goes up first, underneath, and keeps running until either WebRTC has taken
+  // over or something has proved WebRTC is not going to work here.
+  function startMJPEG(note) {
+    showMJPEG();
+    if (note) {
+      say(note, 'wait');
+    }
+    img.onload = function () {
+      retry = 0;
+      if (!pc) {
+        say('live · mjpeg', '');
+      }
+    };
+    img.onerror = function () {
+      img.onload = img.onerror = null;
+      if (pc) {
+        // The underlay is on its way out because WebRTC painted; a broken
+        // image here is nothing to recover from.
+        return;
+      }
+      say('reconnecting…', 'off');
+      setTimeout(function () { startMJPEG(null); }, Math.min(1000 * retry, 5000));
+      retry++;
+    };
+    // The stamp is what makes a retry a retry. Setting the attribute to the
+    // value it already has is not a change, so the browser would not fetch it
+    // again and a broken stream would stay broken. It counts separately from
+    // retry, which is the backoff and is not the same thing.
+    img.src = '/stream?attempt=' + (attempt++);
+  }
+
+  // Dropping the source is what actually closes the connection: an <img> that
+  // has been showing a multipart stream keeps fetching until the src goes.
+  function stopMJPEG() {
+    img.onload = img.onerror = null;
+    img.removeAttribute('src');
+  }
+
+  function teardown() {
+    if (statsTimer) {
+      clearInterval(statsTimer);
+      statsTimer = 0;
+    }
+    if (watchdog) {
+      clearTimeout(watchdog);
+      watchdog = 0;
+    }
+    if (!pc) {
+      return;
+    }
+    var dead = pc;
+    pc = null;
+    dead.ontrack = null;
+    dead.onconnectionstatechange = null;
+    video.srcObject = null;
+    dead.close();
+  }
+
+  // The end of the line: give up on WebRTC for the life of this page and let
+  // MJPEG carry it. Reconnecting over WebRTC would just put a frozen or
+  // half-drawn picture back in front of the viewer.
+  function settle(note) {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    if (picker) {
+      // MJPEG is the one stream on offer and it is not one of the rungs, so
+      // there is nothing left to pick between.
+      picker.disabled = true;
+    }
+    teardown();
+    startMJPEG(note);
+  }
+
+  // Start the page over on a rung. Everything measured about the last connection
+  // describes that connection and nothing else, so it all goes: a frame count
+  // carried over would say the new stream had already presented something, and a
+  // rate carried over would be computed against the wrong picture.
+  function begin() {
+    settled = false;
+    decoded = false;
+    lastBytes = null;
+    lastAt = 0;
+    lastShown = -1;
+    quiet = 0;
     retry = 0;
-    state.textContent = 'live';
-    state.className = '';
-  });
+    if (picker) {
+      picker.disabled = false;
+    }
+    level = chosen();
+    remember();
+    if (HAS_WEBRTC) {
+      // Both at once: the picture is on screen within a frame or two, and stays
+      // there for as long as the WebRTC path takes to prove itself.
+      startMJPEG(null);
+      startWebRTC();
+    } else {
+      settled = true;
+      startMJPEG(null);
+    }
+  }
 
-  img.addEventListener('error', function () {
-    state.textContent = 'reconnecting…';
-    state.className = 'off';
-    retry++;
-    setTimeout(connect, Math.min(1000 * retry, 5000));
-  });
+  function startWebRTC() {
+    if (!HAS_WEBRTC) {
+      settled = true;
+      startMJPEG(null);
+      return;
+    }
+    var conn = new RTCPeerConnection();
+    pc = conn;
 
-  connect();
+    conn.ontrack = function (e) {
+      video.srcObject = e.streams[0] || new MediaStream([e.track]);
+      var playing = video.play();
+      if (playing) {
+        playing.catch(function () {});
+      }
+    };
+    conn.onconnectionstatechange = function () {
+      if (pc !== conn) {
+        return;
+      }
+      switch (conn.connectionState) {
+        case 'connected':
+          if (!decoded) {
+            say('connecting…', 'wait');
+          }
+          break;
+        case 'disconnected':
+          // A short drop usually heals on its own, so wait before giving up.
+          say('reconnecting…', 'wait');
+          if (watchdog) {
+            clearTimeout(watchdog);
+          }
+          watchdog = setTimeout(function () {
+            watchdog = 0;
+            if (pc === conn && conn.connectionState === 'disconnected') {
+              settle('reconnecting…');
+            }
+          }, GIVE_UP_ON_DISCONNECT);
+          break;
+        case 'failed':
+        case 'closed':
+          settle('webrtc failed · mjpeg');
+          break;
+      }
+    };
+
+    // No trickle: the offer has to carry every candidate, so wait for the
+    // agent to finish gathering before it is sent.
+    conn.addTransceiver('video', { direction: 'recvonly' });
+    conn.createOffer()
+      .then(function (offer) { return conn.setLocalDescription(offer); })
+      .then(function () { return gathered(conn); })
+      .then(function () {
+        return fetch('/webrtc', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'offer', sdp: conn.localDescription.sdp, quality: level })
+        }).then(function (res) {
+          if (!res.ok) {
+            throw new Error('signalling returned ' + res.status);
+          }
+          return res.json();
+        });
+      })
+      .then(function (answer) {
+        if (pc !== conn) {
+          return;
+        }
+        return conn.setRemoteDescription(answer).then(function () {
+          pollStats(conn);
+        });
+      })
+      .catch(function (err) {
+        if (pc === conn) {
+          console.warn('tailshare: webrtc unavailable, falling back:', err);
+          settle('webrtc unavailable · mjpeg');
+        }
+      });
+  }
+
+  function gathered(conn) {
+    if (conn.iceGatheringState === 'complete') {
+      return Promise.resolve();
+    }
+    return new Promise(function (resolve) {
+      var settledGather = false;
+      function done() {
+        if (settledGather) {
+          return;
+        }
+        settledGather = true;
+        conn.removeEventListener('icegatheringstatechange', check);
+        clearTimeout(timer);
+        resolve();
+      }
+      function check() {
+        if (conn.iceGatheringState === 'complete') {
+          done();
+        }
+      }
+      var timer = setTimeout(done, GATHER_TIMEOUT);
+      conn.addEventListener('icegatheringstatechange', check);
+    });
+  }
+
+  function pollStats(conn) {
+    // The first keyframe may still be up to a second away, and if the encoder
+    // has none coming the connection is not going to show anything at all.
+    watchdog = setTimeout(function () {
+      watchdog = 0;
+      if (pc === conn && !decoded) {
+        settle('webrtc gave up · mjpeg');
+      }
+    }, FIRST_FRAME_TIMEOUT);
+
+    statsTimer = setInterval(function () {
+      if (pc !== conn) {
+        return;
+      }
+      conn.getStats().then(function (report) {
+        if (pc !== conn) {
+          return;
+        }
+        var inbound = null;
+        var codec = null;
+        report.forEach(function (s) {
+          if (inbound) {
+            if (s.type === 'codec' && s.id === inbound.codecId) {
+              codec = s;
+            }
+            return;
+          }
+          if (s.type === 'inbound-rtp' && s.kind === 'video') {
+            inbound = s;
+          }
+        });
+        if (!inbound) {
+          return;
+        }
+        if (!decoded) {
+          // Wait for a frame that has actually been *shown*, not one that has
+          // merely been decoded: switching a moment early is exactly the blank
+          // screen this underlay exists to prevent.
+          if (!presented(inbound)) {
+            say('waiting for a keyframe…', 'wait');
+            return;
+          }
+          // The underlay has done its job. Everything from here on is measured
+          // against the picture the viewer can actually see.
+          decoded = true;
+          stopMJPEG();
+          showWebRTC();
+          if (watchdog) {
+            clearTimeout(watchdog);
+            watchdog = 0;
+          }
+        }
+        var shown = presented(inbound);
+        quiet = shown > lastShown ? 0 : quiet + 1;
+        lastShown = shown;
+        if (quiet >= STALL_SAMPLES) {
+          settle('webrtc stalled · mjpeg');
+          return;
+        }
+        say(describe(inbound, codec), conn.connectionState === 'connected' ? '' : 'wait');
+      }).catch(function () {});
+    }, 1000);
+  }
+
+  // Frames the viewer has actually been shown, which is not the same as frames
+  // that have been decoded: a decoder can run ahead into its buffer and then
+  // sit there, and only what reaches the screen is worth watching.
+  function presented(inbound) {
+    if (video.getVideoPlaybackQuality) {
+      var total = video.getVideoPlaybackQuality().totalVideoFrames;
+      if (typeof total === 'number') {
+        return total;
+      }
+    }
+    return inbound.framesDecoded || 0;
+  }
+
+  function describe(inbound, codec) {
+    var parts = ['live'];
+    if (codec && codec.mimeType) {
+      parts.push(codec.mimeType.replace('video/', '').toLowerCase());
+    }
+    if (inbound.framesPerSecond) {
+      parts.push(Number(inbound.framesPerSecond).toFixed(0) + ' fps');
+    }
+    var now = performance.now();
+    if (lastBytes !== null && now > lastAt) {
+      var kbps = (inbound.bytesReceived - lastBytes) * 8 / (now - lastAt);
+      if (kbps > 1000) {
+        parts.push((kbps / 1000).toFixed(1) + ' Mbit/s');
+      } else if (kbps > 1) {
+        parts.push(Math.round(kbps) + ' kbit/s');
+      }
+    }
+    lastBytes = inbound.bytesReceived;
+    lastAt = now;
+    if (inbound.roundTripTime) {
+      parts.push(Math.round(inbound.roundTripTime * 1000) + ' ms away');
+    }
+    // How far behind live the picture is: the average time a frame sat in the
+    // jitter buffer. This is the number that says whether the stream feels
+    // live or feels like a slide show.
+    if (inbound.jitterBufferEmittedCount > 0 && inbound.jitterBufferDelay) {
+      var behind = inbound.jitterBufferDelay / inbound.jitterBufferEmittedCount * 1000;
+      parts.push(Math.round(behind) + ' ms behind');
+    }
+    return parts.join(' · ');
+  }
+
+  if (picker) {
+    // There is no way to switch rung on a live connection, so this is a new
+    // page as far as the stream is concerned: the old one is dropped before the
+    // new offer is made, which is also what stops two encoders being paid for at
+    // once on the server.
+    picker.addEventListener('change', function () {
+      teardown();
+      begin();
+    });
+  }
+
+  begin();
+})();
 </script>
 </body>
 </html>
