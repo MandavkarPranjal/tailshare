@@ -64,6 +64,12 @@ type Ladder []Level
 // ParseLevel turns a name into a level. A name is a count of picture lines with
 // a p on the end, which is how resolutions are written down and how the viewer
 // page labels them.
+//
+// The name that comes back is the canonical one rather than the one that went
+// in, so `+720p` and `0720p` are the same level as `720p` and are not a second
+// one. A name is what duplicates are recognised by and what a viewer is sent
+// back in the signalling request, so letting two spellings of one resolution
+// through would start a second encoder for a picture that is already being made.
 func ParseLevel(name string) (Level, error) {
 	name = strings.ToLower(strings.TrimSpace(name))
 	lines, ok := strings.CutSuffix(name, "p")
@@ -84,7 +90,7 @@ func ParseLevel(name string) (Level, error) {
 	if height%2 != 0 {
 		return Level{}, fmt.Errorf("quality: %d lines is odd, which 4:2:0 video cannot have", height)
 	}
-	return Level{Name: name, Height: height}, nil
+	return Level{Name: strconv.Itoa(height) + "p", Height: height}, nil
 }
 
 // Parse turns a comma separated list of resolutions into a ladder. The order
@@ -159,7 +165,9 @@ type Capture struct {
 // as much to encode as a downscale and puts a blurrier version of the picture
 // on the wire, so it is not offered. There is always one level left: a screen
 // too small for the whole ladder is still watchable, and the smallest rung on
-// offer beats a page with nothing to choose.
+// offer beats a page with nothing to choose. An empty ladder is the one case
+// with nothing to fall back on, and returns empty rather than reaching past the
+// end of itself.
 func (l Ladder) Fit(c Capture, maxWidth int) Ladder {
 	fitted := make(Ladder, 0, len(l))
 	for _, level := range l {
@@ -168,7 +176,7 @@ func (l Ladder) Fit(c Capture, maxWidth int) Ladder {
 		}
 		fitted = append(fitted, level)
 	}
-	if len(fitted) == 0 {
+	if len(fitted) == 0 && len(l) > 0 {
 		return l[:1]
 	}
 	return fitted

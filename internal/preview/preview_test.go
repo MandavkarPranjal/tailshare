@@ -165,6 +165,14 @@ func TestSpansCoverEverySourcePixelAtLeastOnce(t *testing.T) {
 			if i > 0 && sp.lo < s[i-1].lo {
 				t.Errorf("spans(%d, %d)[%d] goes backwards: %+v after %+v", c.n, c.m, i, sp, s[i-1])
 			}
+			// Starting past where the span before it ended leaves a run of
+			// source pixels that no destination pixel averages, so they never
+			// reach the picture. Overlapping is fine and is what a picture
+			// being enlarged does; a gap is a hole in it.
+			if i > 0 && sp.lo > s[i-1].hi {
+				t.Errorf("spans(%d, %d)[%d] starts at %d, past the end %d of the span before it: %+v after %+v",
+					c.n, c.m, i, sp.lo, s[i-1].hi, sp, s[i-1])
+			}
 		}
 		if last := s[len(s)-1]; last.hi != c.m {
 			t.Errorf("spans(%d, %d) stops at %d, want %d", c.n, c.m, last.hi, c.m)

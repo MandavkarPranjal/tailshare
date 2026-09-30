@@ -36,6 +36,22 @@ func TestParseLevel(t *testing.T) {
 	}
 }
 
+func TestParseLevelNamesTheLevelCanonically(t *testing.T) {
+	// The count of lines is the level; how it was written is not. The name is
+	// what duplicates are spotted by and what a viewer is sent back in the
+	// signalling request, so a name has to come out the same however it went in.
+	for _, name := range []string{"720p", " 720p ", "720P", "+720p", "0720p", "+0720P"} {
+		level, err := ParseLevel(name)
+		if err != nil {
+			t.Errorf("parsing %q: %v", name, err)
+			continue
+		}
+		if level.Name != "720p" || level.Height != 720 {
+			t.Errorf("parsed %q as %+v, want 720p at 720 lines", name, level)
+		}
+	}
+}
+
 func TestParseLevelRejectsThingsThatAreNotResolutions(t *testing.T) {
 	// 721p is a resolution somebody would reasonably ask for and 4:2:0 cannot
 	// encode: the line is refused here, where the number is, rather than by the
@@ -57,6 +73,20 @@ func TestParseOrdersAndDeduplicates(t *testing.T) {
 	}
 	if got := ladder.Top().Name; got != "1080p" {
 		t.Fatalf("top of the parsed ladder is %s, want 1080p", got)
+	}
+}
+
+func TestParseDropsRespellingsOfOneResolution(t *testing.T) {
+	// Every rung is an ffmpeg of its own, fed the full size capture, so a second
+	// spelling of a rung that is already there is not a duplicate in a list: it
+	// is a second encoder making a picture that is already being made, under a
+	// name the viewer page would offer as a separate choice.
+	ladder, err := Parse("720p, +720p, 0720p, 0720P")
+	if err != nil {
+		t.Fatalf("parsing ladder: %v", err)
+	}
+	if len(ladder) != 1 || ladder.Names() != "720p" {
+		t.Fatalf("parsed %q into %d rungs, want 720p alone", ladder.Names(), len(ladder))
 	}
 }
 
@@ -106,6 +136,22 @@ func TestFitKeepsAtLeastOneLevel(t *testing.T) {
 	narrow := Default.Fit(Capture{Width: 1920, Height: 1080}, 400)
 	if len(narrow) != 1 || narrow[0].Name != "360p" {
 		t.Errorf("fitting to a 400 pixel width gave %q, want 360p alone", narrow.Names())
+	}
+}
+
+// An empty ladder is the one case where the fallback to the smallest rung has
+// nothing to fall back on. Every other entry point here takes an empty ladder as
+// an answer it can give, and so does this one.
+func TestFitOnAnEmptyLadderOffersNothing(t *testing.T) {
+	var empty Ladder
+	for _, fitted := range []Ladder{
+		empty.Fit(Capture{Width: 1920, Height: 1080}, 0),
+		empty.Fit(Capture{}, 0),
+		Ladder{}.Fit(Capture{Width: 640, Height: 200}, 400),
+	} {
+		if len(fitted) != 0 {
+			t.Errorf("fitting an empty ladder gave %q, want nothing", fitted.Names())
+		}
 	}
 }
 

@@ -80,7 +80,7 @@
   <span id="state">connecting…</span>
 </header>
 <main>
-  <video id="screen" autoplay muted playsinline></video>
+  <video id="screen" autoplay muted playsinline aria-label="shared screen"></video>
   <img id="fallback" alt="shared screen">
 </main>
 <footer>{{.Banner}}</footer>
@@ -385,21 +385,20 @@
           return;
         }
         var inbound = null;
-        var codec = null;
         report.forEach(function (s) {
-          if (inbound) {
-            if (s.type === 'codec' && s.id === inbound.codecId) {
-              codec = s;
-            }
-            return;
-          }
-          if (s.type === 'inbound-rtp' && s.kind === 'video') {
+          if (!inbound && s.type === 'inbound-rtp' && s.kind === 'video') {
             inbound = s;
           }
         });
         if (!inbound) {
           return;
         }
+        // The codec is fetched by the id the inbound stats point at rather than
+        // found by walking the report for it. A walk only sees entries that come
+        // after the inbound one, and the browser is free to write the codec out
+        // first, so the status line would be missing the codec name whenever it
+        // did.
+        var codec = inbound.codecId ? report.get(inbound.codecId) : null;
         if (!decoded) {
           // Wait for a frame that has actually been *shown*, not one that has
           // merely been decoded: switching a moment early is exactly the blank

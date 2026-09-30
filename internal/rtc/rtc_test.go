@@ -294,7 +294,11 @@ func TestSignallingGivesUpWhenTheCodecStaysUndescribable(t *testing.T) {
 	}
 }
 
-func TestSignallingWaitsForTheCodec(t *testing.T) {
+// A codec that cannot be described yet is only worth waiting for if something
+// can make it describable. A stream with a Prepare gets that call and is
+// answered once it has; a stream without one has nothing to wait for, so the
+// viewer is turned away straight away rather than left hanging.
+func TestSignallingRefusesWhenNothingCanPrepareTheCodec(t *testing.T) {
 	s := newTestServer(t, oneLevel("1080p", Stream{
 		Codec: func() encode.CodecInfo {
 			return encode.CodecInfo{Codec: encode.CodecH264, MimeType: "video/H264", ClockRate: 90000}
@@ -345,6 +349,10 @@ func (stubBWE) Close() error                                          { return n
 func stubPeers(t *testing.T, s *Server, level string, watching ...stubBWE) {
 	t.Helper()
 	peers := make([]*peer, 0, len(watching))
+	// Written under the lock the server itself uses: New has already started a
+	// monitor that walks this map every second, and a map written without it is
+	// a race that -race reports and a crash waiting to happen.
+	s.mu.Lock()
 	for _, bwe := range watching {
 		p := &peer{
 			server:  s,
@@ -353,8 +361,16 @@ func stubPeers(t *testing.T, s *Server, level string, watching ...stubBWE) {
 			probe:   &probe{rtt: bwe.rtt, loss: bwe.loss},
 		}
 		peers = append(peers, p)
+		// Closed before the server ever gets hold of it. The monitor New
+		// starts closes everything on the list when the test's context ends,
+		// and that happens before the cleanup below can take these off it; a
+		// stub has no connection behind it, so being closed for real would
+		// reach for a cancel function and a peer connection that are not
+		// there. Spending the once here is what leaves close to do nothing.
+		p.once.Do(func() {})
 		s.peers[p] = struct{}{}
 	}
+	s.mu.Unlock()
 	t.Cleanup(func() {
 		s.mu.Lock()
 		for _, p := range peers {
@@ -489,8 +505,10 @@ func TestCloseIsQuietTwice(t *testing.T) {
 	s := newTestServer(t, cfg)
 	s.Close()
 	s.Close()
-	// One report at startup and one for the peers going away; the second Close
-	// has nothing left to close and must not report again.
+	// The only report is the one New makes at startup. Nothing is connected in
+	// this test, so closing takes no peer off the list and neither Close has a
+	// change in the room to report: the count stays at that one startup call,
+	// however many times the empty server is closed.
 	if got := count.Load(); got != 1 {
 		t.Errorf("OnViewers called %d times, want 1", got)
 	}
