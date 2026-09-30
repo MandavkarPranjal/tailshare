@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 
+	"tailshare/internal/quality"
 	"tailshare/internal/stream"
 )
 
@@ -28,14 +29,25 @@ type Config struct {
 	Identity IdentityFunc
 	// Banner is shown on the viewer page footer.
 	Banner string
+	// WebRTC answers the signalling exchange the viewer starts with. When it
+	// is nil the page never offers a WebRTC stream and the viewer uses the
+	// MJPEG endpoint on its own.
+	WebRTC http.Handler
+	// Qualities are the resolutions the viewer may pick between, smallest
+	// first. With none on offer the page shows no picker and the viewer takes
+	// whatever the service sends, which is also what the picker would have
+	// selected if it had been there.
+	Qualities quality.Ladder
 }
 
 // Handler serves the viewer page and the MJPEG stream.
 type Handler struct {
-	hub      *stream.Hub
-	identity IdentityFunc
-	banner   string
-	page     *template.Template
+	hub       *stream.Hub
+	identity  IdentityFunc
+	banner    string
+	webrtc    http.Handler
+	qualities quality.Ladder
+	page      *template.Template
 }
 
 // New builds the HTTP handler.
@@ -47,16 +59,29 @@ func New(cfg Config) (*Handler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("web: parse template: %w", err)
 	}
-	return &Handler{hub: cfg.Hub, identity: cfg.Identity, banner: cfg.Banner, page: page}, nil
+	return &Handler{
+		hub:       cfg.Hub,
+		identity:  cfg.Identity,
+		banner:    cfg.Banner,
+		webrtc:    cfg.WebRTC,
+		qualities: cfg.Qualities,
+		page:      page,
+	}, nil
 }
 
-// ServeHTTP routes / (viewer page) and /stream (MJPEG).
+// ServeHTTP routes / (viewer page), /stream (MJPEG) and /webrtc (signalling).
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/":
 		h.servePage(w, r)
 	case "/stream":
 		h.serveStream(w, r)
+	case "/webrtc":
+		if h.webrtc == nil {
+			http.NotFound(w, r)
+			return
+		}
+		h.webrtc.ServeHTTP(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -69,7 +94,24 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	if err := h.page.Execute(w, struct{ Banner string }{Banner: h.banner}); err != nil {
+	// The chosen resolution rides in the URL rather than in a cookie so that a
+	// link can carry it and so that a viewer who has picked one gets the same
+	// page back on a reload instead of being reset to the top of the ladder.
+	// An unknown name is not an error: the viewer still gets a page, on the best
+	// rung on offer, which is what they would have got without asking.
+	selected := h.qualities.Top()
+	if wanted := r.URL.Query().Get("quality"); wanted != "" {
+		if level, ok := h.qualities.Find(wanted); ok {
+			selected = level
+		}
+	}
+	data := struct {
+		Banner    string
+		WebRTC    bool
+		Qualities quality.Ladder
+		Selected  quality.Level
+	}{Banner: h.banner, WebRTC: h.webrtc != nil, Qualities: h.qualities, Selected: selected}
+	if err := h.page.Execute(w, data); err != nil {
 		log.Printf("web: render page: %v", err)
 	}
 }
