@@ -162,22 +162,39 @@ func TestProbeReadsReceiverReports(t *testing.T) {
 	}
 }
 
+// A report is what the viewer last said rather than the worst it has ever said,
+// so a link that recovers is not held at the worst of it.
 func TestProbeKeepsTheLastReport(t *testing.T) {
 	at := time.Unix(1700000000, 0)
 	p := &probe{}
-	p.record(receiverReport(rtcp.ReceptionReport{FractionLost: 0xff}), at)
+	p.record(receiverReport(rtcp.ReceptionReport{FractionLost: 0x40}), at)
 	p.record(receiverReport(rtcp.ReceptionReport{FractionLost: 0x10}), at)
 	if _, loss := p.measurement(); loss != 0.0625 {
 		t.Errorf("loss = %v, want 0.0625", loss)
 	}
 }
 
+// A full byte of fraction lost is 255 of every 256 packets, which is a link
+// that has stopped carrying the stream rather than a viewer that cannot say.
+// Taking it for a viewer that cannot say left the loss at whatever it was
+// before, so a connection that was receiving almost nothing looked to the
+// controller like a clear one and went on being sent at the full rate.
+func TestProbeReadsALinkThatHasLostAlmostEverything(t *testing.T) {
+	p := &probe{}
+	if _, loss := p.measurement(); loss != 0 {
+		t.Fatalf("a probe that has read no reports at all reports %v of loss", loss)
+	}
+	p.record(receiverReport(rtcp.ReceptionReport{FractionLost: 0xff}), time.Now())
+	if _, loss := p.measurement(); loss != 255.0/256 {
+		t.Errorf("loss = %v, want %v, the fraction the viewer reported", loss, 255.0/256)
+	}
+}
+
 func TestProbeIgnoresWhatItCannotUse(t *testing.T) {
 	p := &probe{}
-	// Nonsense, a report with no blocks, and one that cannot say about loss.
+	// Nonsense, and a report with no blocks: neither has a measurement in it.
 	p.record([]byte{0x01, 0x02, 0x03}, time.Now())
 	p.record(receiverReport(), time.Now())
-	p.record(receiverReport(rtcp.ReceptionReport{FractionLost: 0xff}), time.Now())
 	if rtt, loss := p.measurement(); rtt != 0 || loss != 0 {
 		t.Errorf("probe reported %v and %v from nothing usable", rtt, loss)
 	}

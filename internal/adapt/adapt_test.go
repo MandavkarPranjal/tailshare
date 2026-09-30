@@ -34,6 +34,17 @@ var slow = Config{MaxFPS: 30, MinFPS: 5, Bitrate: 1_000_000, MinBitrate: 100_000
 // that keeps up.
 func roomy(rate int) Feedback { return Feedback{Peers: 1, Bitrate: 100_000_000, Rate: rate} }
 
+// congesting is a feedback sample for a link whose round trip time or loss rate
+// is past watching while the estimate still reports a link with plenty of room.
+// The estimate is generous enough that neither sample is tight and both are
+// comfortable, so the round trip time and the loss are the only measurements in
+// them that could move the target: a controller that watches the estimate alone
+// would take both for a link worth watching.
+var congesting = map[string]Feedback{
+	"round trip": {Peers: 1, Bitrate: 100_000_000, RTT: 900 * time.Millisecond},
+	"loss":       {Peers: 1, Bitrate: 100_000_000, Loss: 0.4},
+}
+
 func TestNewRejectsBadConfig(t *testing.T) {
 	cases := map[string]Config{
 		"min fps zero":      {MinFPS: -1, MaxFPS: 30},
@@ -288,6 +299,62 @@ func TestBitrateCutsAreThrottled(t *testing.T) {
 	}
 }
 
+// The gap between cuts is throttled against the last change there was, so a
+// climb the ceiling clips to nothing is not a change and must not be recorded as
+// one: the cut that follows it is due, and waiting out a gap nothing spent delays
+// it for a congestion that is already being measured.
+func TestAnIncreaseTheCeilingClipsDoesNotHoldOffACut(t *testing.T) {
+	c, clk := newTestController(t, Config{
+		MaxFPS: 30, MinFPS: 5,
+		Bitrate: 1_000_000, MinBitrate: 100_000,
+		// The bitrate starts on its ceiling, so every climb from here is a step
+		// up with nowhere to go.
+		MaxBitrate: 1_000_000,
+	})
+	starved := Feedback{Peers: 1, Bitrate: 200_000}
+	starve := func(step time.Duration) {
+		for range downSamples {
+			clk.at = clk.at.Add(step)
+			c.Observe(starved)
+		}
+	}
+	c.Observe(roomy(0))
+
+	// A cut of its own, since the first cut of a session is never rationed and
+	// the gap is only throttled against one.
+	starve(time.Second)
+	if _, bitrate := target(t, c); bitrate != 700_000 {
+		t.Fatalf("setup: bitrate = %d, want the cautious step down to 700000", bitrate)
+	}
+
+	// A link with room again, and the climb back to the ceiling.
+	clk.at = clk.at.Add(10 * time.Second)
+	c.Observe(roomy(0))
+	clk.at = clk.at.Add(2 * time.Second)
+	c.Observe(roomy(0))
+	if _, bitrate := target(t, c); bitrate != 1_000_000 {
+		t.Fatalf("setup: bitrate = %d, want the climb back to 1000000", bitrate)
+	}
+
+	// Another comfortable stretch at the ceiling: a worthwhile step that the
+	// ceiling leaves nowhere to go.
+	clk.at = clk.at.Add(10 * time.Second)
+	c.Observe(roomy(0))
+	clk.at = clk.at.Add(2 * time.Second)
+	c.Observe(roomy(0))
+	if _, bitrate := target(t, c); bitrate != 1_000_000 {
+		t.Fatalf("setup: bitrate = %d, want it left at 1000000", bitrate)
+	}
+
+	// And the link goes again, four samples closer together than the gap between
+	// cuts, so the cut falls due on the last of them: the change it is
+	// throttled against is the climb that really happened.
+	starve(100 * time.Millisecond)
+	if _, bitrate := target(t, c); bitrate != 700_000 {
+		t.Errorf("bitrate = %d, want the 700000 cut: a climb that changed nothing held it off", bitrate)
+	}
+}
+
 // TestRateOnlyGivesWayWhenTheBitrateIsAtItsFloor covers a network too slow for
 // even the lowest bitrate, where the frame rate is all that is left to give.
 func TestRateOnlyGivesWayWhenTheBitrateIsAtItsFloor(t *testing.T) {
@@ -390,20 +457,113 @@ func TestHighBitrateNeedsDebounce(t *testing.T) {
 	}
 }
 
-func TestHighRateAndLossTriggerDown(t *testing.T) {
-	for name, f := range map[string]Feedback{
-		"round trip": {Peers: 1, Bitrate: 100_000_000, RTT: 900 * time.Millisecond},
-		"loss":       {Peers: 1, Bitrate: 100_000_000, Loss: 0.4},
-	} {
-		c, _ := newTestController(t, slow)
+// One congested sample is not spent on a bitrate: an estimate on its way down is
+// the least trustworthy number in the system, and a cut is a restart every
+// viewer sees as a frozen picture. The frame rate is the other matter and is not
+// rationed this way: it costs nothing, so it goes on the sample that reports the
+// problem rather than waiting for the count to fill.
+func TestOneCongestedSampleDoesNotCutTheBitrate(t *testing.T) {
+	for name, f := range congesting {
+		c, clk := newTestController(t, slow)
 		c.Observe(roomy(0))
 		c.Observe(roomy(0))
-		// Plenty of measured bandwidth, so only the latency and loss can be the
-		// reason to back off. Congestion is acted on at once, without waiting
-		// for the ramp-up streak to break.
+		clk.at = clk.at.Add(time.Second)
 		c.Observe(f)
-		if _, bitrate := target(t, c); bitrate != 1_000_000 {
-			t.Errorf("%s: bitrate = %d, want 1000000: the bitrate was already far under the estimate", name, bitrate)
+		fps, bitrate := target(t, c)
+		if bitrate != 1_000_000 {
+			t.Errorf("%s: bitrate = %d on a single congested sample, want 1000000: a restart was spent on one sample",
+				name, bitrate)
+		}
+		if fps >= 30 {
+			t.Errorf("%s: %d fps on a single congested sample, want below 30: the rate is free and there is no bitrate to cut",
+				name, fps)
+		}
+	}
+}
+
+// A link that keeps saying so gets what it asked for. The frame rate walks down
+// to the floor, because it is the only thing left to ask less of a link whose
+// packets are being lost or waited for. The bitrate does not move at all: the
+// estimate says the link has the room for it, and there is no shortage to cut it
+// back to.
+func TestHighRateAndLossTriggerDown(t *testing.T) {
+	for name, f := range congesting {
+		c, clk := newTestController(t, slow)
+		c.Observe(roomy(0))
+		if fps, bitrate := target(t, c); fps != 30 || bitrate != 1_000_000 {
+			t.Fatalf("%s: setup %d fps at %d bps, want 30 fps at 1000000", name, fps, bitrate)
+		}
+		// Long enough for the rate to reach the floor: a step every hold time,
+		// however many samples each takes to report itself.
+		for range 30 {
+			clk.at = clk.at.Add(time.Second)
+			c.Observe(f)
+		}
+		fps, bitrate := target(t, c)
+		if fps != slow.MinFPS {
+			t.Errorf("%s: %d fps after 30 congested seconds, want the floor of %d: the round trip time and the loss were not acted on",
+				name, fps, slow.MinFPS)
+		}
+		if bitrate != 1_000_000 {
+			t.Errorf("%s: bitrate = %d after 30 congested seconds, want 1000000: the estimate says the link has the room for it",
+				name, bitrate)
+		}
+	}
+}
+
+// The round trip time that counts as congestion is twice the budget the caller
+// set, so a budget is a budget: a link a caller expects to hold together keeps
+// its rate, and one it expects to be impatient with does not.
+func TestTheRTTBudgetDecidesWhatCountsAsLate(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		budget time.Duration
+		rtt    time.Duration
+		late   bool
+	}{
+		{"a patient budget leaves a slow room alone", time.Second, 400 * time.Millisecond, false},
+		{"a patient budget acts past twice itself", time.Second, 3 * time.Second, true},
+		{"an impatient budget acts early", 40 * time.Millisecond, 100 * time.Millisecond, true},
+		{"an impatient budget leaves half its budget alone", 40 * time.Millisecond, 60 * time.Millisecond, false},
+	} {
+		cfg := slow
+		cfg.RTTBudget = c.budget
+		controller, _ := newTestController(t, cfg)
+		// Plenty of measured bandwidth, so the round trip time is the only
+		// measurement here that can move anything.
+		controller.Observe(Feedback{Peers: 1, Bitrate: 100_000_000, RTT: c.rtt})
+
+		want := "left alone"
+		if c.late {
+			want = "given up"
+		}
+		if fps, _ := target(t, controller); (fps < 30) != c.late {
+			t.Errorf("%s: %d fps at a round trip of %v against a budget of %v, want the rate %s",
+				c.name, fps, c.rtt, c.budget, want)
+		}
+	}
+}
+
+// The rate is given up on the strength of one sample, so it has to come back on
+// a couple: a link that was late for a moment is not a reason to sit at the
+// bottom of the rate range for the rest of the session.
+func TestTheRateFollowsALinkThatRecovers(t *testing.T) {
+	for name, f := range congesting {
+		c, clk := newTestController(t, slow)
+		c.Observe(roomy(0))
+		c.Observe(roomy(0))
+		clk.at = clk.at.Add(time.Second)
+		c.Observe(f)
+		if fps, _ := target(t, c); fps >= 30 {
+			t.Fatalf("%s: setup %d fps, want the rate given up before it recovers", name, fps)
+		}
+
+		for range 5 {
+			clk.at = clk.at.Add(2 * time.Second)
+			c.Observe(roomy(0))
+		}
+		if fps, _ := target(t, c); fps != 30 {
+			t.Errorf("%s: %d fps once the link came back, want the 30 it started at", name, fps)
 		}
 	}
 }

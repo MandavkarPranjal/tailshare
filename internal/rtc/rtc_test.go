@@ -514,6 +514,82 @@ func TestCloseIsQuietTwice(t *testing.T) {
 	}
 }
 
+// A server on its way down has no streams left to feed a viewer, so an offer
+// that arrives after the shutdown is turned away rather than negotiated from
+// start to finish and then dropped.
+func TestSignallingTurnsAwayOffersAfterAClose(t *testing.T) {
+	viewer := newTestViewer(t)
+	t.Cleanup(viewer.close)
+	srv := newTestServer(t, oneLevel("1080p", Stream{}))
+	srv.Close()
+	body, err := json.Marshal(viewer.offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := post(t, srv, string(body))
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Errorf("status is %d, want %d: %s", resp.Code, http.StatusServiceUnavailable, resp.Body)
+	}
+	if n := srv.ViewerCount(); n != 0 {
+		t.Errorf("ViewerCount() = %d, want 0, no viewer is answered after a close", n)
+	}
+	// The context the monitor watches is done as well, so a closed server is
+	// not still measuring a room behind the shutdown.
+	if err := srv.ctx.Err(); err == nil {
+		t.Error("the server's context is still live, so the monitor is still running after a close")
+	}
+}
+
+// TestAnOfferInFlightOverACloseIsTurnedAway covers a handshake that was still
+// going when the server was closed: its peer was not in the snapshot Close took
+// and nothing else was ever going to close it, so it would have been left
+// connected and counted as a viewer for good, with no stream left behind it.
+func TestAnOfferInFlightOverACloseIsTurnedAway(t *testing.T) {
+	viewer := newTestViewer(t)
+	t.Cleanup(viewer.close)
+	var describable atomic.Bool
+	asked, ready := make(chan struct{}), make(chan struct{})
+	srv := newTestServer(t, oneLevel("1080p", Stream{
+		Codec: func() encode.CodecInfo {
+			if describable.Load() {
+				return h264WithSets()
+			}
+			return encode.CodecInfo{Codec: encode.CodecH264, MimeType: "video/H264", ClockRate: 90000}
+		},
+		// The wait for a codec to become describable is where the shutdown
+		// lands. Nothing else in this exchange takes long enough to put one in
+		// the middle of it, and a viewer that had to be fed a frame to be able
+		// to wait would make the test a great deal longer.
+		Prepare: func(context.Context) error {
+			close(asked)
+			<-ready
+			describable.Store(true)
+			return nil
+		},
+	}))
+	body, err := json.Marshal(viewer.offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/webrtc", bytes.NewBuffer(body))
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		srv.ServeHTTP(rec, req)
+		close(done)
+	}()
+	<-asked
+	srv.Close()
+	close(ready)
+	<-done
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status is %d, want %d: %s", rec.Code, http.StatusServiceUnavailable, rec.Body)
+	}
+	if n := srv.ViewerCount(); n != 0 {
+		t.Errorf("ViewerCount() = %d, want 0, the viewer that arrived over the shutdown", n)
+	}
+}
+
 // TestViewerReceivesTheStream connects a second pion stack as a viewer and
 // checks that frames reach it over the wire.
 func TestViewerReceivesTheStream(t *testing.T) {

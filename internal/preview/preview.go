@@ -57,6 +57,12 @@ type Preview struct {
 	// next is when the next frame may be published, zero until one is.
 	next time.Time
 
+	// watching says the room has a viewer in it. The picture in the hub and
+	// the rate slot claimed for it belong to whoever is watching, so they are
+	// left for the next viewer to inherit rather than cleared on every frame
+	// that arrives at a room with nobody in it.
+	watching bool
+
 	// lastErr is the last failure reported, so a decode that keeps failing on
 	// every frame is reported once rather than ten times a second.
 	lastErr string
@@ -104,6 +110,23 @@ func (p *Preview) due(now time.Time) bool {
 	return true
 }
 
+// idle forgets what the last viewer was served, once the room has emptied.
+//
+// The picture left in the hub belongs to nobody now, and a viewer arriving
+// later is handed it the moment it subscribes, which is a screen from before
+// they came rather than the one they came for. The rate slot goes with it: it
+// was claimed on behalf of a room that no longer has anybody in it, and a
+// viewer arriving inside the gap the preview rate leaves between pictures would
+// be made to wait out a slot that is being kept for a room that has gone.
+func (p *Preview) idle() {
+	if !p.watching {
+		return
+	}
+	p.watching = false
+	p.next = time.Time{}
+	p.out.Invalidate()
+}
+
 // Hub is where the previewed frames are published, and what the MJPEG endpoint
 // is served from.
 func (p *Preview) Hub() *stream.Hub { return p.out }
@@ -120,8 +143,9 @@ func (p *Preview) String() string {
 // Run previews the source until ctx is done.
 //
 // It costs nothing until somebody is watching: with no subscribers the frames
-// are dropped as they arrive rather than decoded, and the first viewer to
-// arrive is served the next capture rather than a picture from before they came.
+// are dropped as they arrive rather than decoded, and every viewer to arrive is
+// served the next capture rather than a picture from before they came, because
+// what the viewer before them was served is thrown away when the room empties.
 func (p *Preview) Run(ctx context.Context) {
 	ch, cancel := p.cfg.Source.Subscribe(ctx)
 	defer cancel()
@@ -135,8 +159,10 @@ func (p *Preview) Run(ctx context.Context) {
 				return
 			}
 			if p.out.ViewerCount() == 0 {
+				p.idle()
 				continue
 			}
+			p.watching = true
 			if !p.due(p.now()) {
 				continue
 			}

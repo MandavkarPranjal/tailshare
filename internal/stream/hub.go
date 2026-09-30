@@ -66,6 +66,16 @@ func (h *Hub) PublishFrame(f Frame) {
 	}
 }
 
+// Invalidate throws the newest frame away, so that a viewer arriving after this
+// is served the next frame published rather than the one this drops. The
+// subscribers already reading are left alone: they are past the point where the
+// frame is how they got theirs.
+func (h *Hub) Invalidate() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.latest = nil
+}
+
 // Latest returns the most recent frame, if any.
 func (h *Hub) Latest() (Frame, bool) {
 	h.mu.Lock()

@@ -177,7 +177,19 @@ type Encoder struct {
 
 	frames chan Frame
 
-	mu       sync.Mutex
+	// mu guards the fields below: it says what the process is, not how the
+	// encoder came to be that way.
+	mu sync.Mutex
+	// restart guards the handover from one ffmpeg process to the next, which is
+	// a stop, a change and a start and has to happen to one caller at a time.
+	// Two callers each doing their half find the encoder running when they come
+	// to start it, and the loser reports an encoder that is already running
+	// while leaving the bitrate it was asked for recorded on one still going at
+	// the old rate, where the next change to that bitrate takes it for applied
+	// and does nothing at all. It is taken before mu and never the other way
+	// round, and holding mu across a stop would not serve instead, since
+	// stopping a process means waiting for it to flush.
+	restart  sync.Mutex
 	ctx      context.Context
 	bitrate  int
 	fmtp     string
@@ -222,6 +234,15 @@ func New(opts Options) (*Encoder, error) {
 	}
 	if opts.Width < 0 || opts.Width > 0 && opts.Width < 320 {
 		return nil, fmt.Errorf("encode: width %d out of range 0 or 320-7680", opts.Width)
+	}
+	// The -2 in the scale filter is the other dimension rounded to an even
+	// number, so it covers the size of the source but not the one asked for
+	// here: an odd width goes into the command line as it stands and the
+	// process then fails to start on a picture 4:2:0 cannot have. It is refused
+	// here, where the number is, rather than there, where the error is about a
+	// scale and says nothing about which option was wrong.
+	if opts.Width%2 != 0 {
+		return nil, fmt.Errorf("encode: width %d must be even, 4:2:0 pictures have no odd column", opts.Width)
 	}
 	if opts.Height < 0 {
 		return nil, fmt.Errorf("encode: height %d out of range", opts.Height)
@@ -339,6 +360,8 @@ func (e *Encoder) Running() bool {
 
 // Start launches ffmpeg. It fails if the encoder is already running.
 func (e *Encoder) Start(ctx context.Context) error {
+	e.restart.Lock()
+	defer e.restart.Unlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.startLocked(ctx)
@@ -350,6 +373,14 @@ func (e *Encoder) Start(ctx context.Context) error {
 // way in finds nothing to write to and reports the encoder as stopped rather
 // than writing into a closing pipe.
 func (e *Encoder) Stop() {
+	e.restart.Lock()
+	defer e.restart.Unlock()
+	e.stop()
+}
+
+// stop is Stop with the handover already held, for a caller that is part of a
+// handover itself and must not have another one land in the middle of it.
+func (e *Encoder) stop() {
 	e.mu.Lock()
 	cmd, stdin, done := e.cmd, e.stdin, e.done
 	e.stdin = nil
@@ -377,17 +408,23 @@ func (e *Encoder) Stop() {
 // started, at that bitrate or the one it was left at; one already running at it
 // is left alone. The first frame out of a new process is a keyframe, so viewers
 // carry straight on.
+//
+// The stop, the new bitrate and the start are one handover, so two changes
+// arriving together take their turn rather than overlapping: a change of bitrate
+// part way through somebody else's is not a bitrate anybody asked for.
 func (e *Encoder) SetBitrate(ctx context.Context, bps int) error {
 	if bps < 50_000 || bps > 50_000_000 {
 		return fmt.Errorf("encode: bitrate %d out of range 50000-50000000", bps)
 	}
+	e.restart.Lock()
+	defer e.restart.Unlock()
 	e.mu.Lock()
 	unchanged := e.cmd != nil && e.bitrate == bps
 	e.mu.Unlock()
 	if unchanged {
 		return nil
 	}
-	e.Stop()
+	e.stop()
 	e.mu.Lock()
 	e.bitrate = bps
 	err := e.startLocked(ctx)
@@ -672,10 +709,17 @@ func (e *Encoder) finish(cmd *exec.Cmd, readErr error, stderr *ringBuffer) {
 
 // setParameterSets records the H.264 parameter sets seen in a keyframe so that
 // new viewers can be told about them in the SDP offer.
+//
+// A keyframe is where both of them are read, but either can be the one that has
+// changed: ffmpeg writes a new picture parameter set on its own after a restart,
+// and a viewer told the old one in an offer decodes the new pictures with the
+// wrong picture parameter set or not at all. Both are compared rather than the
+// sequence one alone, and the pair is stored together so what is offered is
+// always the pair the stream is being decoded with.
 func (e *Encoder) setParameterSets(sps, pps []byte) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.fmtp == "" || !slices.Equal(sps, e.sps) {
+	if e.fmtp == "" || !slices.Equal(sps, e.sps) || !slices.Equal(pps, e.pps) {
 		e.sps = append(e.sps[:0], sps...)
 		e.pps = append(e.pps[:0], pps...)
 		e.fmtp = parameterSetsFmtp(sps, pps)

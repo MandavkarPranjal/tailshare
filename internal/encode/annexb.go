@@ -34,7 +34,7 @@ type annexBReader struct {
 
 	au     [][]byte // NAL units of the access unit being assembled
 	slices int      // how many of them are slices
-	param  [][]byte // parameter sets waiting for the next access unit
+	param  [][]byte // parameter sets and metadata waiting for the next access unit
 	sps    []byte
 	pps    []byte
 }
@@ -66,9 +66,14 @@ func (a *annexBReader) Next() (codedFrame, error) {
 			a.sps = bytes.Clone(nal)
 		case nalTypePPS:
 			a.pps = bytes.Clone(nal)
-			// A parameter set is only useful with its partner.
+			// A parameter set is only useful with its partner, and it goes
+			// behind the metadata already waiting for the picture rather than
+			// in front of it: an access unit delimiter comes first in the
+			// stream, so taking the queue over from it would throw the
+			// delimiter away, and it is the unit a decoder is told to wait for
+			// a viewer that has just joined.
 			if a.sps != nil {
-				a.param = append(a.param[:0], a.sps, a.pps)
+				a.param = append(a.param, a.sps, a.pps)
 			}
 		case nalTypeSEI, nalTypeAUD:
 			// Metadata for the picture that comes next, which for a
@@ -232,27 +237,47 @@ type bitReader struct {
 	data  []byte
 	pos   int // next byte to read
 	bit   uint
-	zeros int
+	zeros int // zero bytes in a row behind the read head, held at two
 }
 
+// readBit returns the next bit of the unit, most significant of its byte first.
+//
+// The emulation prevention byte is a whole byte sitting between two zero bytes,
+// so it can only be recognised at a byte boundary: the zeros in front of it are
+// zeros in the bytes, not two zero bits somewhere inside one. Counting bits
+// instead finds a real 00 00 03 never, since the eight zero bits of a 0x00 carry
+// the count straight past two, and finds a 0x03 that is a byte of the header
+// always, on the second bit of that byte - dropping it part way through reading
+// it, so every bit after it is read out of step.
 func (b *bitReader) readBit() (uint, error) {
-	if b.pos >= len(b.data) {
-		return 0, io.ErrUnexpectedEOF
-	}
-	bit := (b.data[b.pos] >> (7 - b.bit)) & 1
-	b.bit++
-	if b.bit == 8 {
-		b.bit, b.pos = 0, b.pos+1
-	}
-	if bit == 0 {
-		b.zeros++
-		if b.zeros == 2 && b.pos < len(b.data) && b.data[b.pos] == 0x03 {
-			b.pos, b.zeros = b.pos+1, 0
+	for {
+		if b.pos >= len(b.data) {
+			return 0, io.ErrUnexpectedEOF
 		}
-	} else {
-		b.zeros = 0
+		if b.zeros == 2 && b.data[b.pos] == 0x03 {
+			// There it is: the encoder's 0x03, dropped whole rather than read as
+			// bits, wherever inside it the read head happens to be. The two zero
+			// bytes in front of it are still the last two bytes of the unit, so
+			// the count of them stays where it is.
+			b.pos++
+			continue
+		}
+		cur := b.data[b.pos]
+		bit := (cur >> (7 - b.bit)) & 1
+		b.bit++
+		if b.bit == 8 {
+			b.bit, b.pos = 0, b.pos+1
+			// A byte counts towards the run of zeros only once it has been read
+			// all the way through, which is the only place the count means
+			// anything: the escape that follows is decided on byte boundaries.
+			if cur != 0 {
+				b.zeros = 0
+			} else if b.zeros < 2 {
+				b.zeros++
+			}
+		}
+		return uint(bit), nil
 	}
-	return uint(bit), nil
 }
 
 // readUE reads an unsigned Exp-Golomb value, the encoding slice headers use.

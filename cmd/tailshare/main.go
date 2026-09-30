@@ -129,7 +129,7 @@ func main() {
 	flag.IntVar(&cfg.minFPS, "min-fps", 5, "lowest WebRTC frame rate (1-60)")
 	flag.IntVar(&cfg.bitrate, "bitrate", 4000, "WebRTC bitrate budget in kbit/s at -max-fps for the top of -qualities (default 4000); each rung gets a share of it and the rate sent scales with the frame rate")
 	flag.IntVar(&cfg.keyint, "keyint", 2, "seconds between keyframes (0-10); a viewer waits this long for the first one")
-	flag.IntVar(&cfg.width, "width", 0, "widest picture to offer in pixels, 0 = as captured; a rung that would come out wider is dropped")
+	flag.IntVar(&cfg.width, "width", 0, "widest picture to offer in pixels, 0 = as captured; a rung that would come out wider is dropped, and a cap too narrow for any of them is refused")
 	flag.BoolVar(&cfg.webrtc, "webrtc", true, "serve WebRTC video; off leaves the MJPEG stream as the only transport")
 	flag.IntVar(&cfg.previewWidth, "preview-width", 640, "widest MJPEG fallback picture in pixels, 0 = as captured; never an upscale")
 	flag.IntVar(&cfg.previewFPS, "preview-fps", 10, "MJPEG fallback frame rate (1-60); captures arriving faster are dropped rather than queued")
@@ -268,6 +268,7 @@ func run(ctx context.Context, cfg config) error {
 		capFPS:   cfg.fps,
 		viewers:  make(chan map[string]int, 1),
 		feedback: make(chan rtc.Feedback, 1),
+		wake:     make(chan struct{}, 1),
 		capErr:   &errLogger{what: "capture"},
 	}
 	go captureLoop(ctx, pipe)
@@ -281,7 +282,13 @@ func run(ctx context.Context, cfg config) error {
 		served     quality.Ladder
 	)
 	if cfg.webrtc {
-		served = servedLadder(ladder, quality.Capture{Width: size.Width, Height: size.Height}, cfg.width)
+		// How wide a rung comes out is a fact about the shape of the screen, so
+		// this is as early as -width can be checked against anything.
+		screen := quality.Capture{Width: size.Width, Height: size.Height}
+		if err := widthCapKept(ladder, screen, cfg.width); err != nil {
+			return err
+		}
+		served = servedLadder(ladder, screen, cfg.width)
 		pageBanner, transport, err = pipe.startVideo(ctx, cfg, served)
 		if err != nil {
 			return err
@@ -336,6 +343,28 @@ func run(ctx context.Context, cfg config) error {
 	return nil
 }
 
+// widthCapKept reports whether maxWidth is a width this ladder can be served
+// inside at all.
+//
+// The cap says the widest picture to offer, and the ladder below is the only
+// thing that has to stay inside it, so a cap narrower than the smallest
+// resolution on offer is a number that cannot be kept: the choice is between a
+// page offering nothing to watch and a page offering the picture the flag says
+// was dropped, and the first is the honest one to say out loud rather than
+// serve. No cap, or a capture of unknown shape, is nothing to keep.
+//
+// It is asked after the capture probe, since nothing before it knows how wide a
+// rung comes out, and before the encoders are built, since a ladder that cannot
+// be served is not one to build.
+func widthCapKept(ladder quality.Ladder, c quality.Capture, maxWidth int) error {
+	narrowest := ladder.NarrowestWidth(c)
+	if maxWidth < 1 || narrowest <= maxWidth {
+		return nil
+	}
+	return fmt.Errorf("-width %d is narrower than the smallest resolution on offer: %s is %d pixels wide on a %dx%d screen",
+		maxWidth, ladder[0].Name, narrowest, c.Width, c.Height)
+}
+
 // servedLadder is the ladder as this screen can actually serve it: the
 // resolutions that fit inside the capture, and inside maxWidth, smallest first.
 //
@@ -343,10 +372,17 @@ func run(ctx context.Context, cfg config) error {
 // machine as much to encode as a downscale while putting a blurrier picture on
 // the wire, so it is not offered. -width rules the same way for the other
 // dimension, which is all it has left to say now that the width of the stream is
-// the viewer's choice rather than one number for everybody.
+// the viewer's choice rather than one number for everybody. A screen too small
+// for the whole ladder still gets the smallest rung on offer rather than a page
+// with nothing to pick, as long as that rung is inside maxWidth: a cap that is
+// not is refused by widthCapKept above, and what is left here is the empty
+// ladder that goes with it.
 func servedLadder(ladder quality.Ladder, c quality.Capture, maxWidth int) quality.Ladder {
 	fit := ladder.Fit(c, maxWidth)
-	if len(fit) < len(ladder) {
+	// An empty answer is not something to log as an offer: it is the one widthCapKept
+	// refuses, and a line about offering nothing would only get in the way of
+	// that.
+	if len(fit) > 0 && len(fit) < len(ladder) {
 		bound := fmt.Sprintf("a %dx%d capture", c.Width, c.Height)
 		if maxWidth > 0 {
 			bound += fmt.Sprintf(" and -width %d", maxWidth)
@@ -394,6 +430,16 @@ type pipeline struct {
 	viewers  chan map[string]int
 	feedback chan rtc.Feedback
 
+	// wake asks the control loop to look again now rather than at its next
+	// tick, for the one viewer that has a reason to want frames before it can
+	// be counted: one waiting inside prepare for a keyframe. It is sent on
+	// without blocking and left waiting in the one slot it has, because a wake
+	// dropped on the floor is that viewer waiting out its timeout for captures
+	// the loop would have started at once. One slot is enough, and a second
+	// wake behind the first is a request the first already covers: the loop
+	// reads the numbers afresh either way.
+	wake chan struct{}
+
 	capErr *errLogger
 }
 
@@ -426,6 +472,13 @@ type qualityStream struct {
 	// never turns up and blame the network for the missing frames.
 	measured atomic.Int64
 
+	// preparing counts the viewers waiting for this rung's codec to become
+	// describable. They cannot be counted by the signalling server until they
+	// have an answer, and they cannot have an answer until there has been a
+	// keyframe, which needs the captures that only a watched rung is given.
+	// While it is above zero apply takes this rung for watched.
+	preparing atomic.Int64
+
 	// The encoder lifecycle is guarded because the control loop and a viewer
 	// asking for a codec both have a say in it. idle is when the last viewer of
 	// this rung went.
@@ -437,6 +490,13 @@ type qualityStream struct {
 // and starts the loops that run them. It returns the page banner and a
 // description for the log.
 func (p *pipeline) startVideo(ctx context.Context, cfg config, ladder quality.Ladder) (string, string, error) {
+	// A ladder with nothing left in it has no encoders to build and no picture
+	// to put a name to, and the widths and the top of the ladder below are both
+	// read off it. The caller has been told what was dropped and why by now, so
+	// this is only the last place that can still say so.
+	if len(ladder) == 0 {
+		return "", "", errors.New("no resolution on offer fits this screen")
+	}
 	codec, err := encode.ParseCodec(cfg.codec)
 	if err != nil {
 		return "", "", err
@@ -540,7 +600,7 @@ func (p *pipeline) stream(name string) rtc.Stream {
 	if l == nil {
 		return rtc.Stream{}
 	}
-	return rtc.Stream{Frames: l.video, Codec: l.enc.Codec, Prepare: l.prepare}
+	return rtc.Stream{Frames: l.video, Codec: l.enc.Codec, Prepare: p.prepare(l)}
 }
 
 // rung is the named level's stream, or nil when the name is not on offer.
@@ -555,9 +615,20 @@ func (p *pipeline) rung(name string) *qualityStream {
 
 // reportViewers and reportFeedback hand the latest numbers to the control loop.
 func (p *pipeline) reportViewers(counts map[string]int) {
-	select {
-	case p.viewers <- counts:
-	default:
+	for {
+		select {
+		case p.viewers <- counts:
+			return
+		case <-p.viewers:
+			// A report from an earlier change is still waiting to be read, and
+			// it has been overtaken. Every report is the whole count rather than
+			// a change to it, so the one waiting is worth nothing next to this
+			// one and is thrown away to make room for it: a viewer that
+			// connected and went again between two reads of the control loop
+			// would otherwise leave its rung encoded and the captures running
+			// with nobody watching them, and nothing would come along later to
+			// say otherwise.
+		}
 	}
 }
 
@@ -622,6 +693,10 @@ func (p *pipeline) controlLoop(ctx context.Context) {
 					Rate:    int(l.measured.Load()),
 				})
 			}
+		case <-p.wake:
+			// A rung is preparing a codec for a viewer that cannot be counted
+			// until it has an answer, so counts says nothing new: what is
+			// wanted is that apply runs now rather than at the next tick.
 		case <-ticker.C:
 		}
 		p.apply(counts)
@@ -641,7 +716,12 @@ func (p *pipeline) apply(counts map[string]int) {
 		want = p.mjpegFPS
 	}
 	for _, l := range p.levels {
-		if counts[l.level.Name] < 1 {
+		// A rung somebody is watching is worth capturing for, and so is a rung
+		// whose codec is being prepared: its viewer has not connected, so no
+		// count can say so yet, and it will not connect until it has been
+		// answered, and it cannot be answered until there has been a keyframe
+		// from the very captures this is deciding whether to take.
+		if counts[l.level.Name] < 1 && l.preparing.Load() < 1 {
 			l.update(false)
 			continue
 		}
@@ -719,6 +799,30 @@ func (l *qualityStream) update(want bool) {
 		}
 		log.Printf("%s: encoding up to %d fps at %d kbit/s (was %d kbit/s)",
 			l.level.Name, fps, bitrate/1000, was/1000)
+	}
+}
+
+// prepare is what the signalling server calls for a viewer that arrives before
+// anything has been encoded, carrying the one thing that wait costs the rest of
+// the pipeline.
+//
+// That viewer is not connected yet, so nothing can count it as watching, and a
+// rung with no watchers is given no captures - which is exactly what the
+// keyframe it is waiting for needs. For as long as the wait lasts the rung is
+// taken for watched, and the control loop is woken to say so now rather than at
+// its next tick. Without that, a viewer arriving while the fallback endpoint
+// has no viewer of its own waits out prepareTimeout for a keyframe that is
+// never taken, and is turned away; the same page a moment later, once the
+// fallback has a viewer, would have got in.
+func (p *pipeline) prepare(l *qualityStream) func(context.Context) error {
+	return func(ctx context.Context) error {
+		l.preparing.Add(1)
+		defer l.preparing.Add(-1)
+		select {
+		case p.wake <- struct{}{}:
+		default:
+		}
+		return l.prepare(ctx)
 	}
 }
 

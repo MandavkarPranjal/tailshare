@@ -9,6 +9,7 @@ import (
 	"image/jpeg"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -27,6 +28,10 @@ func TestNewRejectsBadOptions(t *testing.T) {
 		{"width", Options{Width: 10}},
 		{"negative height", Options{Height: -2}},
 		{"odd height", Options{Height: 361}},
+		// An odd width is not caught by the -2 in the scale filter, which is the
+		// other dimension, so it has to be refused here or ffmpeg refuses it a
+		// moment later with nothing to say about which option was wrong.
+		{"odd width", Options{Width: 1281}},
 		{"width and height", Options{Width: 1280, Height: 720}},
 		{"missing binary", Options{Binary: "definitely-not-ffmpeg"}},
 	}
@@ -134,6 +139,35 @@ func TestCodecInfo(t *testing.T) {
 	}
 	if info := auto.Codec(); info.Codec != CodecH264 {
 		t.Errorf("Codec() = %+v, want auto to pick %q", info, CodecH264)
+	}
+}
+
+// TestANewPictureParameterSetIsOffered covers a keyframe that arrives with the
+// same sequence parameter set and a new picture parameter set, which is what
+// ffmpeg writes after a restart. A viewer offered the old picture parameter set
+// decodes the pictures that follow with the wrong one, so the offer has to be
+// brought up to date on either half of the pair changing.
+func TestANewPictureParameterSetIsOffered(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("no ffmpeg")
+	}
+	enc, err := New(Options{Codec: CodecH264, MaxFPS: 10, Bitrate: 500_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sps := []byte{0x67, 0x64, 0x00, 0x1f, 0x00, 0x00, 0x03, 0x00, 0x04}
+	first := []byte{0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0}
+	second := []byte{0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc1}
+	enc.setParameterSets(sps, first)
+	if got, want := enc.Codec().SDPFmtp, parameterSetsFmtp(sps, first); got != want {
+		t.Fatalf("SDPFmtp = %q, want %q", got, want)
+	}
+	if !enc.Codec().Ready {
+		t.Error("the encoder is not ready once it has been given both parameter sets")
+	}
+	enc.setParameterSets(sps, second)
+	if got, want := enc.Codec().SDPFmtp, parameterSetsFmtp(sps, second); got != want {
+		t.Errorf("SDPFmtp = %q, want %q, the picture parameter set the stream is now using", got, want)
 	}
 }
 
@@ -331,15 +365,15 @@ func TestSetBitrateIsFreeWhenItChangesNothing(t *testing.T) {
 		t.Error("SetBitrate at the configured bitrate did not start the encoder")
 	}
 	// The same bitrate again is now a no-op rather than a restart.
-	before := enc.SinceKeyframe()
+	before := ffmpegProcess(enc)
 	if err := enc.SetBitrate(t.Context(), 1_000_000); err != nil {
 		t.Fatal(err)
 	}
 	if !enc.Running() {
 		t.Error("a repeated SetBitrate stopped the encoder")
 	}
-	if got := enc.SinceKeyframe(); got > before {
-		t.Errorf("SinceKeyframe() went from %v to %v, want a restart to have reset it", before, got)
+	if after := ffmpegProcess(enc); after != before {
+		t.Errorf("SetBitrate at the bitrate already in use left ffmpeg %d and started %d, want the process it had left alone", before, after)
 	}
 	// And after a Stop it has to start again.
 	enc.Stop()
@@ -348,6 +382,71 @@ func TestSetBitrateIsFreeWhenItChangesNothing(t *testing.T) {
 	}
 	if !enc.Running() {
 		t.Error("SetBitrate did not restart a stopped encoder")
+	}
+}
+
+// ffmpegProcess is the ffmpeg behind the encoder, or zero if none is running.
+// Restarting replaces the process, so this is what says a change to the bitrate
+// that changed nothing left ffmpeg alone. How long ago the last keyframe came
+// out cannot say that: nothing here is encoded, so there is no keyframe to
+// come out and the answer would be the same either way a restart went.
+func ffmpegProcess(e *Encoder) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.cmd == nil {
+		return 0
+	}
+	return e.cmd.Process.Pid
+}
+
+// TestSetBitrateChangesTakeTheirTurn is the regression test for two bitrate
+// changes arriving together: the second would find the process the first had
+// started, report an encoder that is already running, and leave the bitrate it
+// was asked for recorded on a process still going at the old one, where the next
+// change to that bitrate takes it for applied and does nothing at all. Every
+// change is carried out, and the one that finished last is the one in force.
+func TestSetBitrateChangesTakeTheirTurn(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("no ffmpeg")
+	}
+	enc, err := New(Options{Codec: CodecVP8, MaxFPS: 10, Bitrate: 1_000_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer enc.Stop()
+	ctx := t.Context()
+	const changes = 8
+	var (
+		wg       sync.WaitGroup
+		errs     = make([]error, changes)
+		bitrs    = make([]int, changes)
+		finished = make(chan int, changes)
+	)
+	for i := range changes {
+		bitrs[i] = 300_000 + 100_000*i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = enc.SetBitrate(ctx, bitrs[i])
+			finished <- bitrs[i]
+		}()
+	}
+	wg.Wait()
+	close(finished)
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("SetBitrate(%d) = %v, want every change carried out", bitrs[i], err)
+		}
+	}
+	var last int
+	for bps := range finished {
+		last = bps
+	}
+	if got := enc.Bitrate(); got != last {
+		t.Errorf("Bitrate() = %d, want the %d of the change that finished last", got, last)
+	}
+	if !enc.Running() {
+		t.Error("no process is attached after the changes")
 	}
 }
 

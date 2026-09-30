@@ -96,7 +96,9 @@
   var GIVE_UP_ON_DISCONNECT = 8000;
   // A connection that stops presenting frames is worse than no WebRTC at all:
   // the picture is frozen and the browser has no idea anything is wrong. Three
-  // samples is a second of stats, so three seconds without a new frame.
+  // samples is a second of stats, so three seconds without a new frame. Only
+  // samples from a page on screen are counted, because a hidden page presents
+  // nothing on purpose.
   var STALL_SAMPLES = 3;
 
   var video = document.getElementById('screen');
@@ -179,8 +181,11 @@
         return;
       }
       say('reconnecting…', 'off');
-      setTimeout(function () { startMJPEG(null); }, Math.min(1000 * retry, 5000));
-      retry++;
+      // The wait counts the failure rather than the retry behind it. Counting it
+      // the other way round makes the first retry immediate, and that is the
+      // one that arrives while the server is still down: a burst of requests
+      // against a server that is not answering is the last thing wanted here.
+      setTimeout(function () { startMJPEG(null); }, Math.min(1000 * ++retry, 5000));
     };
     // The stamp is what makes a retry a retry. Setting the attribute to the
     // value it already has is not a change, so the browser would not fetch it
@@ -402,7 +407,8 @@
         if (!decoded) {
           // Wait for a frame that has actually been *shown*, not one that has
           // merely been decoded: switching a moment early is exactly the blank
-          // screen this underlay exists to prevent.
+          // screen this underlay exists to prevent. A hidden page is shown
+          // nothing at all, so it waits on the decoder instead, in presented().
           if (!presented(inbound)) {
             say('waiting for a keyframe…', 'wait');
             return;
@@ -417,9 +423,17 @@
             watchdog = 0;
           }
         }
-        var shown = presented(inbound);
-        quiet = shown > lastShown ? 0 : quiet + 1;
-        lastShown = shown;
+        // Only a viewer can be shown a stalled picture, so only a sample taken
+        // with the page on screen counts. A hidden page stops presenting frames
+        // on purpose, and settling on that would drop a healthy stream for the
+        // life of the page while nobody was watching it. lastShown is left
+        // alone while the page is hidden, so when the viewer comes back the
+        // count resumes against the last picture they actually saw.
+        if (!document.hidden) {
+          var shown = presented(inbound);
+          quiet = shown > lastShown ? 0 : quiet + 1;
+          lastShown = shown;
+        }
         if (quiet >= STALL_SAMPLES) {
           settle('webrtc stalled · mjpeg');
           return;
@@ -432,8 +446,15 @@
   // Frames the viewer has actually been shown, which is not the same as frames
   // that have been decoded: a decoder can run ahead into its buffer and then
   // sit there, and only what reaches the screen is worth watching.
+  //
+  // A hidden page is the exception. The browser stops presenting frames to
+  // save power, so totalVideoFrames freezes on a perfectly healthy stream, and
+  // asking a hidden page for a frame it was never asked to paint would leave
+  // the underlay waiting for a first frame the decoder already has. The
+  // decoder keeps running while the page is hidden, so until the picture can
+  // be shown again, count what it decodes.
   function presented(inbound) {
-    if (video.getVideoPlaybackQuality) {
+    if (!document.hidden && video.getVideoPlaybackQuality) {
       var total = video.getVideoPlaybackQuality().totalVideoFrames;
       if (typeof total === 'number') {
         return total;

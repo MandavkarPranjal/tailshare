@@ -6,6 +6,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -287,6 +288,111 @@ func TestRunCostsNothingWithoutViewers(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if _, ok := p.Hub().Latest(); ok {
 		t.Error("a preview was published with nobody watching")
+	}
+}
+
+// waitForEmpty waits for the preview to have noticed the room was empty and
+// cleared what the last viewer left behind. There is nothing to wait for other
+// than the absence of what is being cleared, so it is the absence that is
+// polled.
+func waitForEmpty(t *testing.T, p *Preview) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := p.Hub().Latest(); !ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the preview never noticed the room was empty")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// The picture a viewer was served belongs to nobody once the room is empty, and
+// a viewer arriving later is handed whatever the hub is holding the moment it
+// subscribes: a screen from before they came, rather than the one they came
+// for. The endpoint exists to show the sharer's screen, so a frozen one left
+// over from a viewer who was here minutes ago is the worst thing it could show.
+func TestRunForgetsThePictureTheLastViewerWasServed(t *testing.T) {
+	src := stream.NewHub()
+	p, err := New(Config{Source: src, Width: 320, FPS: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.Run(ctx)
+
+	frame := jpegOf(t, ramp(320, 180), 60)
+	first, unsub := p.Hub().Subscribe(ctx)
+	src.Publish(frame)
+	select {
+	case <-first:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first viewer was never sent a picture")
+	}
+
+	// Cancelling the subscription takes the viewer out of the room before it
+	// returns, so the capture that follows is certain to be read as a frame
+	// arriving at an empty one.
+	unsub()
+	src.Publish(frame)
+	waitForEmpty(t, p)
+
+	second, unsub2 := p.Hub().Subscribe(ctx)
+	defer unsub2()
+	select {
+	case f := <-second:
+		t.Errorf("a viewer arriving to an empty room was handed %d bytes from before they came", len(f.Data))
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// The other half of what the last viewer left behind is the rate slot the
+// picture claimed, a second of which a preview at 1 fps spends. It was claimed
+// on behalf of a room that no longer has anybody in it, and a viewer arriving
+// inside that second is waiting for a capture rather than for a rate: the
+// capture that arrives is theirs, and it goes out.
+func TestTheRateSlotIsNotHeldForAnEmptyRoom(t *testing.T) {
+	src := stream.NewHub()
+	p, err := New(Config{Source: src, Width: 320, FPS: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A clock of our own, so the gap the viewer leaves behind is a gap rather
+	// than however long the test happens to take. Set before Run starts: the
+	// clock is read from there and nowhere else.
+	var clock atomic.Int64
+	clock.Store(time.Now().UnixNano())
+	p.now = func() time.Time { return time.Unix(0, clock.Load()) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.Run(ctx)
+
+	frame := jpegOf(t, ramp(320, 180), 60)
+	first, unsub := p.Hub().Subscribe(ctx)
+	src.Publish(frame)
+	select {
+	case <-first:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first viewer was never sent a picture")
+	}
+
+	unsub()
+	clock.Add(int64(100 * time.Millisecond))
+	src.Publish(frame)
+	waitForEmpty(t, p)
+
+	second, unsub2 := p.Hub().Subscribe(ctx)
+	defer unsub2()
+	clock.Add(int64(100 * time.Millisecond))
+	src.Publish(frame)
+	select {
+	case <-second:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a viewer arriving just after the last one left was made to wait out the rate rather than the capture")
 	}
 }
 
