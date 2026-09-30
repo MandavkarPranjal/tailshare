@@ -94,6 +94,12 @@
   // the better picture for good. Generous on purpose.
   var FIRST_FRAME_TIMEOUT = 30000;
   var GIVE_UP_ON_DISCONNECT = 8000;
+  // How long the signalling exchange gets before the page stops waiting for it.
+  // The MJPEG stream is on screen the whole time it runs, so the cost of giving
+  // up late is one request the server is not answering; the cost of never giving
+  // up is a page that reads connecting… for good, with a picker that no longer
+  // leads anywhere. Long enough for a loaded machine, short enough to notice.
+  var SIGNALLING_TIMEOUT = 10000;
   // A connection that stops presenting frames is worse than no WebRTC at all:
   // the picture is frozen and the browser has no idea anything is wrong. Three
   // samples is a second of stats, so three seconds without a new frame. Only
@@ -272,7 +278,29 @@
       startMJPEG(null);
       return;
     }
-    var conn = new RTCPeerConnection();
+    // Asking for a connection can be refused outright, and these two calls are
+    // the only ones here that are not part of the promise chain the catch below
+    // belongs to: a browser without WebRTC on a page the server says has it
+    // throws from the constructor, and a browser that will not add the
+    // transceiver throws from that call. Left to escape they come out of
+    // begin() uncaught, and the status line stays on connecting… with the
+    // picker still live, so every change of resolution throws the same way.
+    var conn = null;
+    try {
+      conn = new RTCPeerConnection();
+      // No trickle: the offer has to carry every candidate, so wait for the
+      // agent to finish gathering before it is sent.
+      conn.addTransceiver('video', { direction: 'recvonly' });
+    } catch (err) {
+      console.warn('tailshare: webrtc unavailable, falling back:', err);
+      if (conn) {
+        // Nothing else holds it: teardown only closes what pc points at, and pc
+        // is not set until the connection is one we are going to use.
+        conn.close();
+      }
+      settle('webrtc unavailable · mjpeg');
+      return;
+    }
     pc = conn;
 
     conn.ontrack = function (e) {
@@ -312,24 +340,10 @@
       }
     };
 
-    // No trickle: the offer has to carry every candidate, so wait for the
-    // agent to finish gathering before it is sent.
-    conn.addTransceiver('video', { direction: 'recvonly' });
     conn.createOffer()
       .then(function (offer) { return conn.setLocalDescription(offer); })
       .then(function () { return gathered(conn); })
-      .then(function () {
-        return fetch('/webrtc', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'offer', sdp: conn.localDescription.sdp, quality: level })
-        }).then(function (res) {
-          if (!res.ok) {
-            throw new Error('signalling returned ' + res.status);
-          }
-          return res.json();
-        });
-      })
+      .then(function () { return signal(conn); })
       .then(function (answer) {
         if (pc !== conn) {
           return;
@@ -368,6 +382,36 @@
       }
       var timer = setTimeout(done, GATHER_TIMEOUT);
       conn.addEventListener('icegatheringstatechange', check);
+    });
+  }
+
+  // The exchange the offer goes out in is a request the browser can leave
+  // hanging: a response that never arrives is not a slow success, and nothing
+  // else on the page is waiting for it. The watchdog for a connection that goes
+  // quiet is armed by pollStats, which only runs once there is an answer to
+  // watch, so a stalled request would leave the page on connecting… with the
+  // fallback playing underneath and nothing to say so. The request gets a
+  // deadline of its own, and the abort it raises settles onto MJPEG like any
+  // other reason WebRTC is not going to work.
+  function signal(conn) {
+    var controller = new AbortController();
+    var timer = setTimeout(function () {
+      controller.abort();
+    }, SIGNALLING_TIMEOUT);
+    return fetch('/webrtc', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'offer', sdp: conn.localDescription.sdp, quality: level }),
+      signal: controller.signal
+    }).then(function (res) {
+      clearTimeout(timer);
+      if (!res.ok) {
+        throw new Error('signalling returned ' + res.status);
+      }
+      return res.json();
+    }, function (err) {
+      clearTimeout(timer);
+      throw err;
     });
   }
 

@@ -212,7 +212,7 @@ func TestFitOnAnEmptyLadderOffersNothing(t *testing.T) {
 func TestFitRespectsWidthCapByShapeNotHeight(t *testing.T) {
 	// The same cap, on the same level, either keeps it or drops it depending on
 	// how wide the screen is: 1080 lines of a 4:3 screen is 1440 pixels, and
-	// 1080 lines of a 16:10 one is 1920. So the cap cannot be a comparison on
+	// 1080 lines of a 16:9 one is 1920. So the cap cannot be a comparison on
 	// the height alone.
 	cap := 1450
 	square := Default.Fit(Capture{Width: 1440, Height: 1080}, cap)
@@ -221,7 +221,7 @@ func TestFitRespectsWidthCapByShapeNotHeight(t *testing.T) {
 	}
 	wide := Default.Fit(Capture{Width: 2560, Height: 1440}, cap)
 	if got := wide.Names(); got != "360p, 480p, 720p" {
-		t.Errorf("a 16:10 capture capped to %d wide gave %q, want 360p, 480p, 720p", cap, got)
+		t.Errorf("a 16:9 capture capped to %d wide gave %q, want 360p, 480p, 720p", cap, got)
 	}
 	// The height of the capture is unknown, so nothing is dropped.
 	if got := Default.Fit(Capture{}, 0).Names(); got != Default.Names() {

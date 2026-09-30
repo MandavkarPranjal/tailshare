@@ -574,10 +574,13 @@ type peer struct {
 	gate   gate
 	once   sync.Once
 
-	// mu guards the two fields the connection's own callbacks touch.
+	// mu guards the fields the connection's own callbacks touch. back is the
+	// channel the disconnect timer is waiting on; closing it is how that timer
+	// is told the viewer came back.
 	mu      sync.Mutex
 	codec   webrtc.RTPCodecParameters
 	askedAt time.Time
+	back    chan struct{}
 }
 
 func (s *Server) newPeer(r *http.Request, quality string, level Stream, info encode.CodecInfo) (*peer, error) {
@@ -610,11 +613,19 @@ func (s *Server) newPeer(r *http.Request, quality string, level Stream, info enc
 // the answer's feedback to what both ends asked for, so a codec registered
 // without any of it ends up with an answer that negotiates no retransmission
 // and no keyframe requests at all, and the viewer has no way to ask for either.
+//
+// Transport-wide congestion feedback is the one the estimator runs on. The
+// receiver reports the sequence numbers it actually got, which is a measurement
+// of the path rather than an opinion about the pictures, so the estimate it
+// produces is what this link can carry rather than what a sender would like to
+// send. Without it the answer negotiates none and the estimate stays at the
+// bitrate it started with, however well or badly the link is doing.
 var videoFeedback = []webrtc.RTCPFeedback{
 	{Type: "nack"},
 	{Type: "nack", Parameter: "pli"},
 	{Type: "ccm", Parameter: "fir"},
 	{Type: "goog-remb"},
+	{Type: "transport-cc"},
 }
 
 // dial builds the peer connection, the track that carries the screen and the
@@ -876,21 +887,49 @@ func (p *peer) stateChanged(state webrtc.PeerConnectionState) {
 	switch state {
 	case webrtc.PeerConnectionStateConnected:
 		log.Printf("webrtc: viewer %s: connected", p.id)
+		// Any timer still running from an earlier disconnect belongs to a
+		// disconnection this connection is no longer in.
+		p.woke()
 	case webrtc.PeerConnectionStateDisconnected:
 		// A viewer that has gone quiet usually leaves the connection looking
 		// disconnected for a while before it is declared failed, so give it a
-		// chance to come back before taking the stream away from it.
-		go func() {
+		// chance to come back before taking the stream away from it. The timer
+		// is waiting on this channel rather than on the grace period alone,
+		// because a viewer that does come back before it runs out must keep its
+		// stream: a grace period measured from the first disconnection closes
+		// a connection that has been up and working since.
+		go func(back <-chan struct{}) {
 			select {
 			case <-p.ctx.Done():
+			case <-back:
 			case <-time.After(p.server.grace):
 				p.close()
 			}
-		}()
+		}(p.disconnected())
 	case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
 		// Closing from inside the callback would be closing a connection while
 		// the code announcing that closure is still running.
 		go p.close()
+	}
+}
+
+// disconnected hands back the channel a disconnect timer waits on, and makes a
+// fresh one: a viewer that drops again after coming back owes a new wait.
+func (p *peer) disconnected() <-chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.back = make(chan struct{})
+	return p.back
+}
+
+// woke says the connection is connected again, which retires any timer still
+// counting down towards closing it.
+func (p *peer) woke() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.back != nil {
+		close(p.back)
+		p.back = nil
 	}
 }
 

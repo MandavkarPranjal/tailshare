@@ -242,7 +242,10 @@ func TestAnswerNegotiatesTheFeedbackTheViewerNeeds(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &answer); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"nack", "nack pli", "ccm fir"} {
+	// Transport-wide congestion feedback is in the list because the estimator
+	// runs on it: an answer without it leaves the stream rate at the bitrate it
+	// started with however bad the link gets.
+	for _, want := range []string{"nack", "nack pli", "ccm fir", "transport-cc"} {
 		if !strings.Contains(answer.SDP, want) {
 			t.Errorf("the answer does not offer %q, so the viewer cannot ask for it:\n%s", want, answer.SDP)
 		}
@@ -496,6 +499,68 @@ func TestKeyframeRequestsAreCountedOnce(t *testing.T) {
 	if p.wantsKeyframe([]byte{0xff, 0xff, 0xff}) {
 		t.Error("a report that is not a report at all was counted as a request")
 	}
+}
+
+// The grace period is a chance for a viewer that has stopped answering to come
+// back, not a sentence passed on the moment it went away. A viewer that is back
+// inside it is watching again, and the timer left over from the disconnection it
+// recovered from has to be retired rather than left to run out on a connection
+// that has been up and working ever since.
+func TestAViewerThatComesBackKeepsItsStreamPastTheGrace(t *testing.T) {
+	const grace = 300 * time.Millisecond
+	cfg := oneLevel("1080p", Stream{})
+	cfg.DisconnectGrace = grace
+	s := newTestServer(t, cfg)
+	p := signIn(t, s)
+
+	p.stateChanged(webrtc.PeerConnectionStateDisconnected)
+	p.stateChanged(webrtc.PeerConnectionStateConnected)
+	time.Sleep(4 * grace)
+
+	if n := s.ViewerCount(); n != 1 {
+		t.Errorf("ViewerCount = %d, want 1: a viewer that came back was dropped by the timer from the disconnection it recovered from", n)
+	}
+}
+
+func TestAViewerThatStaysGoneIsDroppedAfterTheGrace(t *testing.T) {
+	const grace = 300 * time.Millisecond
+	cfg := oneLevel("1080p", Stream{})
+	cfg.DisconnectGrace = grace
+	s := newTestServer(t, cfg)
+	p := signIn(t, s)
+
+	p.stateChanged(webrtc.PeerConnectionStateDisconnected)
+	deadline := time.Now().Add(10 * time.Second)
+	for s.ViewerCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if n := s.ViewerCount(); n != 0 {
+		t.Errorf("ViewerCount = %d, want 0: a viewer that never came back was kept", n)
+	}
+}
+
+// signIn posts a real offer and hands back the peer the server built for it
+// without letting the two connect. The state changes these tests are about are
+// driven by hand, and an ICE connection arriving underneath them would be a
+// second opinion on the same connection.
+func signIn(t *testing.T, s *Server) *peer {
+	t.Helper()
+	viewer := newTestViewer(t)
+	t.Cleanup(viewer.close)
+	body, err := json.Marshal(viewer.offer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := post(t, s, string(body))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status is %d, want 200: %s", resp.Code, resp.Body)
+	}
+	peers := s.snapshot()
+	if len(peers) != 1 {
+		t.Fatalf("the server has %d viewers, want 1", len(peers))
+	}
+	return peers[0]
 }
 
 func TestCloseIsQuietTwice(t *testing.T) {
@@ -773,6 +838,14 @@ func newTestViewer(t *testing.T, quality ...string) *testViewer {
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		t.Fatalf("register codecs: %v", err)
 	}
+	// A browser asks for transport-wide congestion feedback and gets an answer
+	// that negotiates it only if the server asks for it too, so a viewer built
+	// from the default codecs alone offers none and cannot tell whether the
+	// answer carries any.
+	mediaEngine.RegisterFeedback(
+		webrtc.RTCPFeedback{Type: webrtc.TypeRTCPFBTransportCC},
+		webrtc.RTPCodecTypeVideo,
+	)
 	registry := &interceptor.Registry{}
 	if err := webrtc.ConfigureTWCCSender(mediaEngine, registry); err != nil {
 		t.Fatalf("transport feedback: %v", err)
