@@ -5,6 +5,8 @@ import (
 	"context"
 	"image"
 	"image/jpeg"
+	"net/http"
+	"net/http/httptest"
 	"os/exec"
 	"strings"
 	"testing"
@@ -12,6 +14,7 @@ import (
 
 	"tailshare/internal/preview"
 	"tailshare/internal/quality"
+	"tailshare/internal/rtc"
 	"tailshare/internal/stream"
 )
 
@@ -240,6 +243,122 @@ func TestTheEncoderIsToldTheRateTheCapturesCanDeliver(t *testing.T) {
 	}
 	if fps, _ := rung.rate.Target(); fps != 24 {
 		t.Errorf("the controller aims at %d fps, want the same 24", fps)
+	}
+}
+
+// The signalling server turns a viewer away for a level that is not on offer,
+// and that refusal only reaches production if this end hands back nothing for
+// such a name. Handing the top rung over instead would count the viewer under a
+// level the control loop has never heard of, so the rung actually being fed
+// would see nobody watching it and stop its encoder.
+func TestAnUnknownRungIsRefusedRatherThanServedAsAnother(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("no ffmpeg")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	jpeg := stream.NewHub()
+	pipe := &pipeline{
+		grab:     stubGrab{},
+		jpeg:     jpeg,
+		preview:  testPreview(t, jpeg, 10),
+		mjpegFPS: 10,
+		capFPS:   60,
+	}
+	ladder := servedLadder(ladderOf(t, "360p,720p,1080p"),
+		quality.Capture{Width: 1920, Height: 1080}, 0)
+	cfg := config{
+		codec:     "vp8",
+		maxFPS:    30,
+		minFPS:    5,
+		bitrate:   4000,
+		keyint:    2,
+		fps:       60,
+		quality:   60,
+		qualities: "360p,720p,1080p",
+	}
+	if _, _, err := pipe.startVideo(ctx, cfg, ladder); err != nil {
+		t.Fatal(err)
+	}
+	defer pipe.stop()
+
+	// The names are the ones the signalling server passes: it folds case and
+	// space away before asking, so these are already the bare spelling. The
+	// empty one is an offer with no quality in it at all.
+	for _, name := range []string{"", "4320p", "721p"} {
+		if got := pipe.stream(name); got.Frames != nil || got.Codec != nil {
+			t.Errorf("stream(%q) was served, want the zero stream that means not on offer", name)
+		}
+	}
+	if got := pipe.stream("720p"); got.Frames == nil || got.Codec == nil {
+		t.Error("a rung on offer came back as the zero stream, so every offer would be refused")
+	}
+
+	// And through the signalling server itself, with this wiring in place of
+	// the one its own tests use: the refusal is the package's, but reaching it
+	// is this function's job.
+	srv, err := rtc.New(ctx, rtc.Config{Streams: pipe.stream})
+	if err != nil {
+		t.Fatalf("rtc.New: %v", err)
+	}
+	defer srv.Close()
+	body := `{"type":"offer","quality":"4320p","sdp":"v=0"}`
+	req := httptest.NewRequest(http.MethodPost, "/webrtc", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("a viewer asking for 4320p got status %d, want %d: %s",
+			rec.Code, http.StatusBadRequest, rec.Body)
+	}
+}
+
+// The ladder is not the only thing the encoders are built from, and the flags
+// that decide what they are built with are read in startVideo: after the
+// display has been probed and after setupTailnet. A mistake in one of them is
+// the same complaint at the same price, and with -webrtc off nothing would read
+// them at all, so they are checked here, before anything is started.
+func TestTheWebRTCFlagsAreCaughtBeforeAnythingIsStarted(t *testing.T) {
+	base := config{
+		mode:           "local",
+		fps:            30,
+		qualities:      "360p",
+		previewFPS:     10,
+		previewQuality: 45,
+		codec:          "auto",
+		maxFPS:         60,
+		minFPS:         5,
+		bitrate:        4000,
+		keyint:         2,
+	}
+	tests := []struct {
+		name  string
+		wrong func(*config)
+		want  string
+	}{
+		{"codec", func(c *config) { c.codec = "vp10" }, "unknown codec"},
+		{"max-fps above the range", func(c *config) { c.maxFPS = 61 }, "-max-fps must be between 1 and 60"},
+		{"max-fps below the range", func(c *config) { c.maxFPS = 0 }, "-max-fps must be between 1 and 60"},
+		{"min-fps above the range", func(c *config) { c.minFPS = 600 }, "-min-fps must be between 1 and 60"},
+		{"bitrate above what an encoder accepts", func(c *config) { c.bitrate = 60_000 }, "-bitrate must be between 0 and 50000"},
+		{"keyint above the range", func(c *config) { c.keyint = 11 }, "-keyint must be between 0 and 10"},
+		// -fps is the ceiling on the frame rate, whatever -max-fps says, so a
+		// floor above it is the same failure the controller would report once
+		// the capture and the login had already been paid for.
+		{"min-fps above -fps", func(c *config) { c.minFPS = 40 }, "-min-fps must not be above"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base
+			tt.wrong(&cfg)
+			err := run(context.Background(), cfg)
+			if err == nil {
+				t.Fatal("no error, want the flag complained about before anything is started")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error is %q, want it to mention %q", err, tt.want)
+			}
+		})
 	}
 }
 

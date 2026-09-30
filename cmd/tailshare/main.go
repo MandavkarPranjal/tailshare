@@ -177,6 +177,38 @@ func run(ctx context.Context, cfg config) error {
 	if err != nil {
 		return err
 	}
+	// The WebRTC flags are checked here for the same reason: the encoders and
+	// their controllers are the only things that read them, and they are built
+	// after the capture probe and after setupTailnet, so a mistake in one of
+	// them would otherwise surface once a display and a login have already been
+	// paid for. With -webrtc off nothing reads them at all, and a flag that is
+	// never going to be used is still one that was asked for wrongly, which is
+	// also how -width above is treated.
+	if _, err := encode.ParseCodec(cfg.codec); err != nil {
+		return err
+	}
+	if cfg.maxFPS < 1 || cfg.maxFPS > 60 {
+		return fmt.Errorf("-max-fps must be between 1 and 60, got %d", cfg.maxFPS)
+	}
+	if cfg.minFPS < 1 || cfg.minFPS > 60 {
+		return fmt.Errorf("-min-fps must be between 1 and 60, got %d", cfg.minFPS)
+	}
+	// In kbit/s, and the budget for the whole ladder: the top rung is given all
+	// of it and every other rung a share of it, so this is also the ceiling
+	// encode.New puts on any one rung.
+	if cfg.bitrate < 0 || cfg.bitrate > 50_000 {
+		return fmt.Errorf("-bitrate must be between 0 and 50000 kbit/s, got %d", cfg.bitrate)
+	}
+	if cfg.keyint < 0 || cfg.keyint > 10 {
+		return fmt.Errorf("-keyint must be between 0 and 10, got %d", cfg.keyint)
+	}
+	// The controller is capped at the lower of -max-fps and -fps when it is
+	// built, so that is the ceiling -min-fps has to fit under, and a floor above
+	// it fails there rather than here.
+	if ceiling := min(cfg.maxFPS, cfg.fps); cfg.minFPS > ceiling {
+		return fmt.Errorf("-min-fps must not be above the lower of -max-fps and -fps (%d), got %d",
+			ceiling, cfg.minFPS)
+	}
 
 	grab, err := capture.New(capture.Options{
 		Backend: cfg.capture,
@@ -493,14 +525,20 @@ func (p *pipeline) startSignalling(ctx context.Context, svc *service) (http.Hand
 }
 
 // stream is the rung a viewer asked for, as the signalling server needs it.
+//
+// A name that is not on offer comes back as the zero stream, which is what the
+// signalling server refuses a request with: the picture a viewer gets is the
+// picture it chose, and a page left over from a differently configured server
+// is better sent to the MJPEG it falls back to than given a rung it did not ask
+// for. Handing the top rung to an unknown name would be worse than a refusal
+// even if the picture were welcome, because that name is what the viewer counts
+// and the measurements are keyed by: the rung actually being fed would see
+// nobody watching it and stop its encoder, and its feedback would arrive under
+// a level this pipeline has never heard of.
 func (p *pipeline) stream(name string) rtc.Stream {
-	// A name that is not on offer means a viewer that has not chosen, or a link
-	// that was written when a different ladder was running. Both get the best
-	// picture on offer, which is what either would have got without a picker,
-	// and is better than a refused offer and a fallback to MJPEG.
 	l := p.rung(name)
 	if l == nil {
-		l = p.levels[len(p.levels)-1]
+		return rtc.Stream{}
 	}
 	return rtc.Stream{Frames: l.video, Codec: l.enc.Codec, Prepare: l.prepare}
 }
