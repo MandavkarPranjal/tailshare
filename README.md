@@ -132,7 +132,9 @@ A rung taller than the capture is an upscale, which costs the machine as much to
 encode as a downscale and puts a blurrier picture on the wire, so it is not
 offered, and neither is one that would come out wider than `-width`. A screen too
 small for the whole ladder still gets the smallest rung on offer rather than a
-page with nothing to pick.
+page with nothing to pick, as long as that rung is inside `-width`. A `-width`
+below every resolution on offer is refused instead: there is no picture small
+enough to serve, and offering a wider one is the thing the cap is there to stop.
 
 The defaults are not trying to squeeze the machine: 30 captures a second, 4
 Mbit/s at the top of the ladder, and stopping entirely when nobody is watching.

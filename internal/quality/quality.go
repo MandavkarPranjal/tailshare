@@ -163,11 +163,17 @@ type Capture struct {
 //
 // A level taller than the capture would be an upscale, which costs the machine
 // as much to encode as a downscale and puts a blurrier version of the picture
-// on the wire, so it is not offered. There is always one level left: a screen
+// on the wire, so it is not offered. There is usually one level left: a screen
 // too small for the whole ladder is still watchable, and the smallest rung on
-// offer beats a page with nothing to choose. An empty ladder is the one case
-// with nothing to fall back on, and returns empty rather than reaching past the
-// end of itself.
+// offer beats a page with nothing to choose. The width cap is the exception,
+// because it is a number the caller was given rather than one that can be read
+// off the screen: a level that would come out wider than it is not offered even
+// to keep the page watchable, since the cap was asked for as a promise and this
+// rung would be the one breaking it. A cap below the narrowest rung on offer
+// therefore leaves nothing here, and it is for the caller to refuse it rather
+// than to be handed a picture it says it may not have. An empty ladder is the
+// other case with nothing to offer, and returns empty rather than reaching past
+// the end of itself.
 func (l Ladder) Fit(c Capture, maxWidth int) Ladder {
 	fitted := make(Ladder, 0, len(l))
 	for _, level := range l {
@@ -176,21 +182,51 @@ func (l Ladder) Fit(c Capture, maxWidth int) Ladder {
 		}
 		fitted = append(fitted, level)
 	}
-	if len(fitted) == 0 && len(l) > 0 {
-		return l[:1]
+	if len(fitted) > 0 || len(l) == 0 {
+		return fitted
 	}
-	return fitted
+	// Nothing fits, so the narrowest rung on offer is the last one worth
+	// trying - as long as it is the capture that is stopping it and not the
+	// width. The ladder runs smallest first, so the first rung inside the cap
+	// is the narrowest picture that can be served at all.
+	for _, level := range l {
+		if level.withinWidth(c, maxWidth) {
+			return Ladder{level}
+		}
+	}
+	return nil
+}
+
+// NarrowestWidth is how wide the narrowest picture on this ladder comes out on a
+// capture of the given size: the smallest rung scaled to the capture's shape,
+// rounded up to the even column an encoder will scale it to, since what is
+// compared against a width cap is the picture that will be on the wire rather
+// than the arithmetic behind it. Zero when the ladder is empty or the shape of
+// the capture is not known, which is also a width no picture of it can break.
+func (l Ladder) NarrowestWidth(c Capture) int {
+	if len(l) == 0 || c.Width <= 0 || c.Height <= 0 {
+		return 0
+	}
+	// The ladder runs smallest first, so the first rung is the narrowest one.
+	wide := (l[0].Height*c.Width + c.Height - 1) / c.Height
+	return wide + wide%2
 }
 
 // fits reports whether a level is within both the capture and the width cap.
-//
-// The capture's shape matters: a 5:4 screen scaled to 1080 lines comes out
-// wider than a 16:9 one does, so the height alone is not enough to tell whether
-// a level is a downscale.
 func (l Level) fits(c Capture, maxWidth int) bool {
 	if c.Height > 0 && l.Height > c.Height {
 		return false
 	}
+	return l.withinWidth(c, maxWidth)
+}
+
+// withinWidth reports whether a level comes out no wider than the cap.
+//
+// The capture's shape matters: a 5:4 screen scaled to 1080 lines comes out
+// wider than a 16:9 one does, so the height alone is not enough to tell whether
+// a level is inside a cap. No cap, or a capture whose width is not known, is no
+// bound at all, so nothing is outside it.
+func (l Level) withinWidth(c Capture, maxWidth int) bool {
 	if c.Width <= 0 || maxWidth <= 0 {
 		return true
 	}

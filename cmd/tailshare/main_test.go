@@ -93,6 +93,60 @@ func TestServedLadderAlwaysLeavesSomethingToWatch(t *testing.T) {
 	}
 }
 
+// A -width below every resolution on offer is a width nothing can be served
+// inside, and the two ways of carrying on from there are a page offering nothing
+// to watch and a page offering a picture the flag says was dropped. The cap is
+// refused, and the refusal names the cap and the width the smallest resolution
+// needs, since that is the number the person who set it has to change.
+func TestAWidthCapNarrowerThanEveryResolutionIsRefused(t *testing.T) {
+	ladder := ladderOf(t, "360p,720p,1080p")
+	hd := quality.Capture{Width: 1920, Height: 1080}
+	err := widthCapKept(ladder, hd, 400)
+	if err == nil {
+		t.Fatal("a 400 pixel cap was accepted on a 1920x1080 screen, where 360p is 640 across")
+	}
+	for _, want := range []string{"-width 400", "360p", "640"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error is %q, want it to name %q", err, want)
+		}
+	}
+	// A cap the smallest rung comes out inside is a cap that can be kept, at
+	// exactly the width it needs as well as above it, and no cap is nothing to
+	// keep either way.
+	for _, width := range []int{0, 640, 700, 7680} {
+		if err := widthCapKept(ladder, hd, width); err != nil {
+			t.Errorf("-width %d was refused on a 1920x1080 screen: %v", width, err)
+		}
+	}
+	// The shape of the capture is what decides it, so a cap nothing is known to
+	// break is not refused by guesswork.
+	if err := widthCapKept(ladder, quality.Capture{}, 400); err != nil {
+		t.Errorf("a cap was refused for a capture of unknown shape: %v", err)
+	}
+}
+
+// The rungs a width cap rules out go with the cap, all of them: what is left is
+// the empty ladder that widthCapKept refuses, rather than one rung that breaks it.
+func TestServedLadderLeavesNothingWhenNoRungFitsTheWidth(t *testing.T) {
+	fit := servedLadder(ladderOf(t, "360p,720p"), quality.Capture{Width: 1920, Height: 1080}, 400)
+	if len(fit) != 0 {
+		t.Errorf("ladder is %q under a 400 pixel cap, want nothing at all", fit.Names())
+	}
+}
+
+// An empty ladder is not a page with no choice, it is a page with no picture, so
+// the encoders are not built from one and it is said rather than indexed into.
+func TestAnEmptyLadderIsRefusedBeforeAnyEncoderIsBuilt(t *testing.T) {
+	pipe := &pipeline{grab: stubGrab{}}
+	_, _, err := pipe.startVideo(context.Background(), config{qualities: "360p"}, nil)
+	if err == nil {
+		t.Fatal("an empty ladder was built from")
+	}
+	if !strings.Contains(err.Error(), "no resolution") {
+		t.Errorf("error is %q, want it to say nothing is on offer", err)
+	}
+}
+
 func TestServedLadderRejectsWhatIsNotAResolution(t *testing.T) {
 	for _, spec := range []string{"", "nope", "1080p,nope", "721p"} {
 		if _, err := quality.Parse(spec); err == nil {
@@ -393,6 +447,112 @@ func TestTheEndpointRunsTheCapturesAtItsOwnRate(t *testing.T) {
 	pipe.apply(nil)
 	if got := int(pipe.fps.Load()); got != 0 {
 		t.Errorf("capture rate is %d once the viewer left, want 0", got)
+	}
+}
+
+// The counts handed to the control loop are the whole count and not a change to
+// it, so only the newest one is worth reading. A viewer that connects and goes
+// again between two reads reports twice into a one-slot queue, and if the second
+// report is the one dropped the rung keeps encoding and the captures keep
+// running with an empty room: the room going empty is the last thing that will
+// ever be said about it, so nothing corrects it afterwards.
+func TestOnlyTheNewestViewerCountIsLeftWaiting(t *testing.T) {
+	pipe := &pipeline{viewers: make(chan map[string]int, 1)}
+	pipe.reportViewers(map[string]int{"720p": 1})
+	pipe.reportViewers(map[string]int{"360p": 2})
+	pipe.reportViewers(map[string]int{})
+	if got := <-pipe.viewers; len(got) != 0 {
+		t.Errorf("the control loop was left %v, want the empty room the last viewer left", got)
+	}
+}
+
+// Viewers come and go on whichever goroutine finished its handshake or its
+// connection, so more than one report can be on its way at once. None of them may
+// be lost silently or left blocked on the one slot: the newest has to end up
+// waiting, and every reporter has to be through.
+func TestEveryoneGetsTheirViewerCountReported(t *testing.T) {
+	pipe := &pipeline{viewers: make(chan map[string]int, 1)}
+	const reporters = 32
+	done := make(chan struct{}, reporters)
+	for i := range reporters {
+		go func() {
+			pipe.reportViewers(map[string]int{"720p": i})
+			done <- struct{}{}
+		}()
+	}
+	for range reporters {
+		<-done
+	}
+	if got := <-pipe.viewers; got["720p"] < 0 || got["720p"] >= reporters {
+		t.Errorf("the control loop was left with %v, which is not a count anybody reported", got)
+	}
+	if len(pipe.viewers) != 0 {
+		t.Error("a report is still waiting after the newest one landed")
+	}
+}
+
+// H.264 cannot be described until the encoder has put out a keyframe, so a
+// viewer arriving while nothing else is being watched waits inside prepare for
+// frames that are only taken for rungs somebody is watching. That viewer
+// cannot be reported as watching until it has an answer, so the wait itself
+// has to ask for the captures: otherwise prepare sits out its whole timeout
+// waiting for a keyframe that can never arrive and turns the viewer away,
+// while the same page a moment later, with the fallback endpoint open, would
+// have got through.
+func TestPreparingAKeyframeTakesTheCapturesItNeeds(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("no ffmpeg")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	jpeg := stream.NewHub()
+	pipe := &pipeline{
+		grab:     stubGrab{},
+		jpeg:     jpeg,
+		preview:  testPreview(t, jpeg, 10),
+		mjpegFPS: 10,
+		capFPS:   60,
+		wake:     make(chan struct{}),
+		capErr:   &errLogger{what: "capture"},
+	}
+	ladder := servedLadder(ladderOf(t, "720p"), quality.Capture{Width: 1920, Height: 1080}, 0)
+	cfg := config{
+		codec:     "h264",
+		maxFPS:    30,
+		minFPS:    5,
+		bitrate:   4000,
+		keyint:    2,
+		fps:       60,
+		quality:   60,
+		qualities: "720p",
+	}
+	if _, _, err := pipe.startVideo(ctx, cfg, ladder); err != nil {
+		t.Fatal(err)
+	}
+	defer pipe.stop()
+
+	// Nobody is watching, so nothing is being captured - and a viewer that has
+	// not been counted yet looks exactly like that.
+	pipe.apply(nil)
+	if got := int(pipe.fps.Load()); got != 0 {
+		t.Fatalf("capture rate is %d with nobody watching, want 0", got)
+	}
+	if ready := pipe.rung("720p").enc.Codec().Ready; ready {
+		t.Fatal("the codec describes itself before any keyframe, so nothing would be prepared")
+	}
+
+	go pipe.controlLoop(ctx)
+	go captureLoop(ctx, pipe)
+
+	prepared := make(chan error, 1)
+	go func() { prepared <- pipe.stream("720p").Prepare(ctx) }()
+
+	// The captures are running for the viewer that is only waiting to be
+	// answered, and stay running for as long as it waits.
+	waitFor(t, func() bool { return int(pipe.fps.Load()) > 0 })
+	if err := <-prepared; err != nil {
+		t.Fatalf("preparing the codec: %v", err)
 	}
 }
 

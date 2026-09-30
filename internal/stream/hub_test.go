@@ -27,6 +27,27 @@ func TestSubscribeReceivesPublishedFrames(t *testing.T) {
 	}
 }
 
+// The frame a hub hands a viewer as it arrives is how a viewer arriving to a
+// hub nobody has published to for a while is given a picture rather than a
+// wait, so throwing that frame away is what makes the next one wait.
+func TestInvalidateLeavesTheNextViewerToWait(t *testing.T) {
+	h := NewHub()
+	h.Publish([]byte("old"))
+
+	h.Invalidate()
+	if _, ok := h.Latest(); ok {
+		t.Error("the frame was still on offer after an invalidate")
+	}
+
+	ch, cancel := h.Subscribe(context.Background())
+	defer cancel()
+	select {
+	case f := <-ch:
+		t.Errorf("a viewer arriving after an invalidate was handed %q", f.Data)
+	default:
+	}
+}
+
 func TestSubscribeSeesLatestFrameFirst(t *testing.T) {
 	h := NewHub()
 	h.Publish([]byte("old"))

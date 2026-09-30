@@ -68,6 +68,72 @@ func slice(typ byte, first int) []byte {
 	return out
 }
 
+// bitCount reads a unit to the end and reports how many bits came out of it,
+// which is what tells a unit with an emulation prevention byte in it from the
+// same unit without one: the bytes in between are not bits anybody wanted.
+func bitCount(data []byte) int {
+	b := &bitReader{data: data}
+	bits := 0
+	for {
+		if _, err := b.readBit(); err != nil {
+			return bits
+		}
+		bits++
+	}
+}
+
+// A 0x03 between two zero bytes is the encoder keeping a start code out of the
+// unit, so the bits behind it are the ones in the byte that follows it. A 0x03
+// with anything else in front of it is a byte of the unit like any other, and
+// dropping that one takes a byte of the middle of a header out of the picture.
+func TestEmulationPreventionBytesAreDropped(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data []byte
+		want int
+	}{
+		{"escaped", []byte{0x00, 0x00, 0x03, 0x80}, 24},
+		{"escaped after a longer run of zeros", []byte{0x00, 0x00, 0x00, 0x03, 0x80}, 32},
+		{"a 0x03 with nothing in front of it", []byte{0x03, 0x80}, 16},
+		{"a 0x03 after one zero", []byte{0x00, 0x03, 0x80}, 24},
+		{"a 0x03 after something else", []byte{0x80, 0x00, 0x03}, 24},
+	} {
+		if got := bitCount(tc.data); got != tc.want {
+			t.Errorf("%s: read %d bits, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// first_macroblock_in_slice is the field the access units are split on, and the
+// bytes a slice header is read out of can hold a 0x03 either as a byte of its
+// own or as the encoder's escape. Read as one, the byte is dropped part way
+// through and every bit behind it is read out of step, which is a picture split
+// in the wrong place. The escaped case needs a field wide enough for the escape
+// to fall inside it, hence the ridiculous macroblock count: what is under test
+// is the arithmetic, not a header anybody would be sent.
+func TestASliceHeaderIsReadThrough03Bytes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// 0x03 0x00 is the header of a slice starting at macroblock 95
+		// (000000 1 100000), and 0x00 0x00 0x80 0x00 0x00 0x00 with the 0x03
+		// put back into it is the header of one starting at 16777215.
+		nal  []byte
+		want int
+	}{
+		{"a 0x03 of its own", []byte{0x41, 0x03, 0x00, 0x11, 0x00}, 95},
+		{"an escaped 0x03", []byte{0x41, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x03, 0x00}, 16777215},
+	} {
+		got, err := firstMacroblock(tc.nal)
+		if err != nil {
+			t.Errorf("%s: firstMacroblock(%x): %v", tc.name, tc.nal, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("%s: first macroblock is %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestAnnexBReader(t *testing.T) {
 	sps := []byte{0x67, 0x64, 0x00, 0x1f, 0x00, 0x00, 0x03, 0x00, 0x04}
 	pps := []byte{0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0}
@@ -115,6 +181,27 @@ func TestAnnexBReader(t *testing.T) {
 	if fmtp := parameterSetsFmtp(gotSPS, gotPPS); !strings.Contains(fmtp, "sprop-parameter-sets=") ||
 		!strings.Contains(fmtp, "profile-level-id=64001F") {
 		t.Errorf("parameterSetsFmtp = %q, want the profile and the parameter sets", fmtp)
+	}
+}
+
+// TestMetadataAheadOfTheParameterSetsSurvives covers the order ffmpeg writes:
+// the access unit delimiter goes in front of the parameter sets, and the
+// recovery point behind them. The parameter sets join the queue for the picture
+// rather than taking it over, so the delimiter is still in the access unit the
+// viewer is handed.
+func TestMetadataAheadOfTheParameterSetsSurvives(t *testing.T) {
+	sps := []byte{0x67, 0x64, 0x00, 0x1f, 0x00, 0x00, 0x03, 0x00, 0x04}
+	pps := []byte{0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0}
+	aud := []byte{0x09, 0x10}
+	sei := []byte{0x06, 0x05, 0x01, 0x02, 0x03, 0x04, 0x80}
+	idr := slice(0x65, 0)
+	r := newAnnexBReader(bytes.NewReader(annexBStream(aud, sps, pps, sei, idr)), nil)
+	f, err := r.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := annexBUnit(aud, sps, pps, sei, idr); !bytes.Equal(f.data, want) {
+		t.Errorf("access unit = %x, want %x, the delimiter in front of the parameter sets", f.data, want)
 	}
 }
 

@@ -67,11 +67,10 @@ func (p *probe) recordBlock(block rtcp.ReceptionReport, at time.Time) {
 	if rtt, ok := roundTrip(block, at); ok {
 		p.rtt = rtt
 	}
-	// A viewer that cannot work out the loss says so with a full byte, which
-	// would otherwise read as a link dropping every packet.
-	if block.FractionLost == 0xff {
-		return
-	}
+	// The fraction counts 256ths of the packets lost since the last report, so
+	// a full byte is 255 of every 256 of them and not an unknown. A viewer that
+	// is getting almost nothing is the one most worth knowing about, and the
+	// controller can only cut the stream down for it if it is told.
 	p.loss = float64(block.FractionLost) / 256
 }
 

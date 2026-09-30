@@ -62,7 +62,9 @@ const (
 	// report a quarter of its real rate for a second and then climb back.
 	// Cutting the bitrate on that would restart the encoder and freeze
 	// everyone's picture to chase a number that was never true. The frame
-	// rate, which costs nothing, still reacts to a single bad sample.
+	// rate, which costs nothing, still reacts to a single bad sample, though
+	// only where the complaint is a round trip time or a loss rate rather than
+	// a shortage of bandwidth, since a bitrate cut is what answers that.
 	downSamples = 4
 	// downBitrateStep is the largest fraction of the current bitrate one cut
 	// may remove. Together with downSamples this means a collapse in the
@@ -82,9 +84,6 @@ const (
 	maxLoss = 0.1
 	// maxRTT is the round trip time the stream aims to stay below.
 	maxRTT = 250 * time.Millisecond
-	// idleRTT is the round trip time above which congestion is assumed even
-	// when the estimator reports plenty of room.
-	idleRTT = 2 * maxRTT
 )
 
 // Config is the controller's operating range. Zero fields take a default.
@@ -241,18 +240,35 @@ func (c *Controller) Observe(f Feedback) {
 	// its bitrate on it either way.
 	behind := f.Rate > 0 && f.Rate < int(float64(c.fps)*behindFactor)
 	tight := usable > 0 && float64(usable) < float64(c.bitrate)*tightFactor
-	late := f.RTT > idleRTT || f.Loss > maxLoss
+	// Twice the budget rather than the budget itself: a round trip inside the
+	// budget is latency the stream can be watched through, and one past twice it
+	// is congestion even where the estimator reports plenty of room. The budget
+	// is the caller's, so the threshold moves with it.
+	late := f.RTT > 2*c.cfg.RTTBudget || f.Loss > maxLoss
 	comfortable := usable == 0 || float64(usable) >= float64(c.bitrate)*looseFactor
 
 	switch {
 	case tight || late:
 		// Congestion is the one thing worth reacting to straight away, but
-		// what it is worth reacting to depends on which knob is turned. The
-		// frame rate is free, so it gives way at once. The bitrate is not, and
-		// a bandwidth estimate on its way down is the least trustworthy number
-		// in the system, so it waits to be sure.
+		// what it is worth reacting to depends on which knob is turned. A link
+		// short of bandwidth is answered with the bitrate, which is the only
+		// one of the two that changes what goes on the wire, and it waits to be
+		// sure as well: a cut is an encoder restart the viewers see as a frozen
+		// picture, and a bandwidth estimate on its way down is the least
+		// trustworthy number in the system.
+		//
+		// A round trip time or a loss rate is a different complaint, and the
+		// estimate is not what is being made: the link has the room for what is
+		// being sent, so there is no bitrate to cut to and a cut would freeze
+		// everybody's picture to chase a shortage nobody reported. The frame
+		// rate is what is left, it costs nothing, and every frame it does not
+		// send is one the link does not have to lose or wait for. So it gives
+		// way on the sample that says so, streak or not.
 		c.good = 0
 		c.bad++
+		if late {
+			c.shrinkLocked(0, now)
+		}
 		if c.bad >= downSamples || !c.running() {
 			c.downLocked(usable, now)
 		}
@@ -294,7 +310,8 @@ func (c *Controller) usable(f Feedback) int {
 // carry is what the measurements are complaining about. The frame rate is left
 // where it is, because a slower rate spends the same bitrate on fewer, larger
 // frames and buys nothing but choppiness. Only once the bitrate has bottomed out
-// is there anything left to give up.
+// is there anything left to give up, and a rate already given away for a link
+// that is losing packets rather than short of bandwidth stays given away.
 //
 // The first cut of a session is not rationed. The encoder was started at a
 // guessed bitrate and the send side has been queueing the difference ever since,
@@ -399,6 +416,13 @@ func (c *Controller) upLocked(usable, rate int, now time.Time) {
 	if next == c.bitrate || next < c.bitrate+int(float64(c.bitrate)*upStep) {
 		return
 	}
-	c.bitrate = min(c.cfg.MaxBitrate, next)
-	c.changed = now
+	// The ceiling can leave a worthwhile step nowhere to go, and a bitrate
+	// already sitting on it is not raised. Nothing changed, so nothing is
+	// recorded either: this timestamp is what holds off the next congestion cut,
+	// and a gap it spends on a climb that never happened is a cut that waits on
+	// nothing.
+	if next = min(c.cfg.MaxBitrate, next); next <= c.bitrate {
+		return
+	}
+	c.bitrate, c.changed = next, now
 }

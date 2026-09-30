@@ -126,16 +126,70 @@ func TestFitDropsLevelsTallerThanTheCapture(t *testing.T) {
 }
 
 func TestFitKeepsAtLeastOneLevel(t *testing.T) {
-	// A capture too small for the smallest rung, or a width cap too narrow to
-	// hold it, would leave nothing to watch. The smallest rung is always offered
-	// instead, since a page with no choice is worse than a small picture.
+	// A capture too small for the smallest rung would leave nothing to watch.
+	// The smallest rung is always offered instead, since a page with no choice
+	// is worse than a small picture.
 	flat := Default.Fit(Capture{Width: 320, Height: 200}, 0)
 	if len(flat) != 1 || flat[0].Name != "360p" {
 		t.Errorf("fitting to a 200 line capture gave %q, want 360p alone", flat.Names())
 	}
-	narrow := Default.Fit(Capture{Width: 1920, Height: 1080}, 400)
+	// The same capture with a cap the smallest rung does come out inside: it is
+	// too tall for the capture and still the only rung inside the cap, so the
+	// width has not stopped it.
+	narrow := Default.Fit(Capture{Width: 320, Height: 200}, 600)
 	if len(narrow) != 1 || narrow[0].Name != "360p" {
-		t.Errorf("fitting to a 400 pixel width gave %q, want 360p alone", narrow.Names())
+		t.Errorf("fitting to a 200 line capture capped to 600 wide gave %q, want 360p alone", narrow.Names())
+	}
+}
+
+// The width cap is a number the caller was given rather than one that can be read
+// off the screen, and it outranks the promise that something is always left to
+// watch: 360 lines of a 16:9 screen is 640 across, so a 400 pixel cap has no rung
+// that keeps it. Offering 360p anyway would put a wider picture on the wire than
+// the one that was asked for, which is the one thing the cap is there to stop.
+func TestFitKeepsTheWidthCapOverTheFallbackRung(t *testing.T) {
+	hd := Capture{Width: 1920, Height: 1080}
+	if narrow := Default.Fit(hd, 400); len(narrow) != 0 {
+		t.Errorf("fitting to a 400 pixel width gave %q, want nothing at all", narrow.Names())
+	}
+	// 360 lines of that capture is 640 across, so 640 is the narrowest cap that
+	// keeps the smallest rung and everything under it, and nothing above it.
+	if got := Default.Fit(hd, 640).Names(); got != "360p" {
+		t.Errorf("fitting to a 640 pixel width gave %q, want 360p", got)
+	}
+	if got := Default.Fit(hd, 900).Names(); got != "360p, 480p" {
+		t.Errorf("fitting to a 900 pixel width gave %q, want 360p, 480p", got)
+	}
+	// A capture too small for the smallest rung and a cap below what it comes
+	// out at are the same answer as a cap below every rung: nothing to serve.
+	if narrow := Default.Fit(Capture{Width: 320, Height: 200}, 400); len(narrow) != 0 {
+		t.Errorf("fitting to a 200 line capture capped to 400 wide gave %q, want nothing at all", narrow.Names())
+	}
+}
+
+// NarrowestWidth is the number a width cap is compared against, so it has to be
+// the width the encoder will actually scale to rather than the arithmetic behind
+// it: 360 lines of a 1366 pixel wide screen is 640.31 across, which ffmpeg rounds
+// up to the even column 4:2:0 needs.
+func TestNarrowestWidth(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		ladder  Ladder
+		capture Capture
+		want    int
+	}{
+		{"16 by 9", Default, Capture{Width: 1920, Height: 1080}, 640},
+		{"4 by 3", Default, Capture{Width: 1440, Height: 1080}, 480},
+		{"rounded up to an even column", Default, Capture{Width: 1366, Height: 768}, 642},
+		{"the smallest rung of several", Ladder{{Name: "480p", Height: 480}, {Name: "720p", Height: 720}},
+			Capture{Width: 1920, Height: 1080}, 854},
+		{"a capture of unknown shape", Default, Capture{}, 0},
+		{"a capture of unknown height", Default, Capture{Width: 1920}, 0},
+		{"an empty ladder", nil, Capture{Width: 1920, Height: 1080}, 0},
+	} {
+		if got := tc.ladder.NarrowestWidth(tc.capture); got != tc.want {
+			t.Errorf("the narrowest width of a %s capture is %d, want %d", tc.name, got, tc.want)
+		}
 	}
 }
 

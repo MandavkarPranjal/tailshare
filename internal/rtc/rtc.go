@@ -142,8 +142,8 @@ type Config struct {
 	OnViewers func(map[string]int)
 
 	// OnFeedback is called once a second with what the viewers of each level can
-	// take, and once with no quality and no peers when the last one goes.
-	// Optional.
+	// take, and once with no quality and no peers when the last one goes, which
+	// is what a Close reports as it empties the room. Optional.
 	OnFeedback func(Feedback)
 }
 
@@ -153,12 +153,20 @@ type Server struct {
 	initialBitrate int
 	grace          time.Duration
 
-	// ctx bounds the life of every peer, so that shutting the server down
-	// takes the connections with it.
-	ctx context.Context
+	// ctx bounds the life of every peer and of the monitor, so that shutting
+	// the server down takes the connections with it. Close cancels it as well
+	// as the caller does, so that both are one shutdown: a handshake still in
+	// flight comes out of a context that is already done rather than one
+	// nothing is left to watch.
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	mu    sync.Mutex
-	peers map[*peer]struct{}
+	mu sync.Mutex
+	// closed says the server has been shut down and no longer answers viewers.
+	// It is read where a peer is published, which is the last moment a peer
+	// that would otherwise be missed by the shutdown can be turned away.
+	closed bool
+	peers  map[*peer]struct{}
 
 	// lastReport is the feedback as each level was last written to the log, and
 	// reported says which levels have had a line at all yet.
@@ -178,11 +186,11 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		cfg:            cfg,
 		initialBitrate: cfg.InitialBitrate,
 		grace:          cfg.DisconnectGrace,
-		ctx:            ctx,
 		peers:          make(map[*peer]struct{}),
 		lastReport:     make(map[string]Feedback),
 		reported:       make(map[string]bool),
 	}
+	s.ctx, s.cancel = context.WithCancel(ctx)
 	if s.initialBitrate <= 0 {
 		s.initialBitrate = defaultInitialBitrate
 	}
@@ -192,7 +200,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	if cfg.OnViewers != nil {
 		cfg.OnViewers(map[string]int{})
 	}
-	go s.monitor(ctx)
+	go s.monitor(s.ctx)
 	return s, nil
 }
 
@@ -212,11 +220,23 @@ type httpError struct {
 
 func (e *httpError) Error() string { return e.err.Error() }
 
+// errShuttingDown is what a viewer is told when it offers to a server that has
+// been closed. It is a plain failure rather than a 404: the offer was perfectly
+// good, and a viewer that retries once the server is back will be answered.
+var errShuttingDown = errors.New("rtc: the server is shutting down")
+
 // ServeHTTP answers one viewer: an offer in, an answer out.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// A server on its way down has nothing left to feed a viewer, so an offer
+	// that arrives after the shutdown is turned away rather than negotiated
+	// from start to finish and then dropped.
+	if s.shuttingDown() {
+		http.Error(w, errShuttingDown.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	answer, p, err := s.answer(r)
@@ -301,7 +321,13 @@ func (s *Server) answer(r *http.Request) (signal, *peer, error) {
 		p.close()
 		return signal{}, nil, err
 	}
-	s.add(p)
+	if !s.add(p) {
+		// The server was shut down while this handshake was in flight, so the
+		// peer was never in the snapshot Close took and nothing else is going
+		// to close it. An answer would be a connection nothing is left to feed.
+		p.close()
+		return signal{}, nil, &httpError{http.StatusServiceUnavailable, errShuttingDown}
+	}
 	return answer, p, nil
 }
 
@@ -328,17 +354,51 @@ func (s *Server) levels() map[string]int {
 	return counts
 }
 
-// Close drops every viewer. It is safe to call more than once.
+// Close drops every viewer and turns away the ones on their way in. It is safe
+// to call more than once.
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		// The context every peer's comes from, so that a handshake still in
+		// flight is taken down with the rest. Its peer is not in the snapshot
+		// below and never will be, and without this it would be left holding a
+		// connection that nothing is left to feed. It also stops the monitor,
+		// so shutting the server down is the same thing however it is asked
+		// for.
+		s.cancel()
 		for _, p := range s.snapshot() {
 			p.close()
+		}
+		// The room is empty now, and an empty room is the report everything is
+		// stood down from. While the server is running the monitor is what says
+		// so, once a second; it has just been stopped, so a shutdown says it
+		// here instead, once, however the server was closed.
+		if s.cfg.OnFeedback != nil {
+			s.cfg.OnFeedback(Feedback{})
 		}
 	})
 }
 
-func (s *Server) add(p *peer) {
+// shuttingDown reports whether the server has been shut down.
+func (s *Server) shuttingDown() bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
+// add publishes a peer and starts it. It reports false if the server was shut
+// down before the peer got here, leaving the peer to its caller to close: it was
+// checked and put on the list under one lock, so a shutdown either had not
+// started, and closes it with everything else, or had, and this peer never
+// reaches the list that shutdown took.
+func (s *Server) add(p *peer) bool {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return false
+	}
 	s.peers[p] = struct{}{}
 	s.mu.Unlock()
 	counts := s.levels()
@@ -348,6 +408,7 @@ func (s *Server) add(p *peer) {
 		s.cfg.OnViewers(counts)
 	}
 	go p.run()
+	return true
 }
 
 func (s *Server) remove(p *peer) {
@@ -387,6 +448,9 @@ func (s *Server) snapshot() []*peer {
 // one viewer on a slow link is what decides how fast that level's stream can
 // go, and a viewer watching at one level says nothing about the link to the
 // viewers watching at another.
+//
+// It runs until the server's context is done, which is either the caller's or
+// Close's, and stops there itself rather than leaving the measurement going.
 func (s *Server) monitor(ctx context.Context) {
 	ticker := time.NewTicker(feedbackInterval)
 	defer ticker.Stop()
